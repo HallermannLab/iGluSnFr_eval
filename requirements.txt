@@ -3,8 +3,11 @@ numpy==2.2.6
 matplotlib==3.10.3
 scipy==1.14.1
 openpyxl==3.1.5
-fastparquet==2024.11.0
-pyarrow==20.0.0
-pyqtgraph==0.13.7
-PyQt5==5.15.11
+imagej==0.3.2
+ImageIO==2.37.2 # not sure if needed
+scikit-image==0.25.2
+#fastparquet==2024.11.0
+#pyarrow==20.0.0
+#pyqtgraph==0.13.7
+#PyQt5==5.15.11
 # maybe use pip install PyQt5 instead

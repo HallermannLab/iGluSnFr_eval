@@ -8,17 +8,415 @@ except ImportError:
     )
     raise SystemExit(1)
 import os
-import sys
+
 from datetime import datetime
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter, find_peaks
-import heka_reader
+
+
+from scipy.signal import butter, filtfilt
+from scipy.optimize import curve_fit
+
 import git_save as myGit
-from collections import defaultdict
-import json
-from statistics import median
+from skimage import io
+#import zipfile
+
+
+VIDEO_FILES = ["ap1+train.tif", "ap2.tif", "ap3.tif", "ap4.tif", "ap5.tif"]
+
+
+def calculate_diff_image(tif_path, output_path):
+    """
+    Calculates difference image (Stim - Baseline) similar to the notebook logic.
+    """
+    try:
+        img = io.imread(tif_path)
+
+        # Frames from notebook: BL 410-415, Stim 365-375.
+        # NOTE: These frames seem hardcoded in the user example.
+        # Ensure these match the 'ap1+train.tif' structure for all experiments.
+        Start_BL = 410
+        End_BL = 415
+        Start_Stim = 365
+        End_Stim = 375
+
+        # Safety check for frame indices
+        if img.shape[0] <= max(Start_BL, End_BL, Start_Stim, End_Stim):
+            print(f"Warning: Image at {tif_path} has fewer frames than expected indices. Using defaults.")
+
+        # Calculate averages
+        BL = img[Start_BL:End_BL].mean(axis=0).astype(np.float32)
+        Stim = img[Start_Stim:End_Stim].mean(axis=0).astype(np.float32)
+
+        # Subtract (Stim - BL), clip negative values
+        img_responding = np.clip(Stim - BL, 0, 65535).astype(np.uint16)
+
+        # Save
+        io.imsave(output_path, img_responding, check_contrast=False)
+        print(f"Saved Diff image: {output_path}")
+        return True
+    except Exception as e:
+        print(f"Error calculating diff image for {tif_path}: {e}")
+        return False
+
+
+def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
+    print(f"    Running analysis for block: {block_name}")
+
+    # Constants / Config
+    VIDEO_CSV_FILES = ["ap1+train.csv", "ap2.csv", "ap3.csv", "ap4.csv", "ap5.csv"]
+
+    # Ensure output directory exists
+    output_dir = output_folder_ROIs
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Load Data
+    dict_data_signal = {}
+    list_ROIs = None
+
+    # Check files availability
+    files_found = []
+    for csv_file in VIDEO_CSV_FILES:
+        full_path = os.path.join(block_path, csv_file)
+        if os.path.exists(full_path):
+            try:
+                # Assuming CSVs have ROIs as columns.
+                df = pd.read_csv(full_path)
+                # If "Average" or "Err" columns exist, drop them (backward compatibility)
+                cols_to_drop = [c for c in df.columns if c in ["Average", "Err", " "]]
+                if cols_to_drop:
+                    df = df.drop(cols_to_drop, axis=1)
+
+                dict_data_signal[csv_file] = df
+                files_found.append(csv_file)
+
+                if list_ROIs is None:
+                    list_ROIs = list(df.columns)
+            except Exception as e:
+                print(f"      Error reading {csv_file}: {e}")
+        else:
+            print(f"      File not found: {full_path}")
+
+    if not files_found:
+        print("      No CSV files found. Aborting analysis.")
+        return
+
+    # 2. Pre-calculations & Constants
+    try:
+        acq_time = float(recording_params["acquisition time (ms)"])
+        butter_cutoff = float(recording_params["butter cutoff freq"])
+
+        baseline_dur = float(recording_params["baseline dur (ms)"])
+        trace_start_offset = float(recording_params["trace start offset dur (ms)"])
+        max_value_dur = float(recording_params["max value dur (ms)"])
+
+        num_stim = int(recording_params["number of stim"])
+        first_stim_time = float(recording_params["first stim timepoint (ms)"])
+        inter_stim_dur = float(recording_params["inter stimulus dur (ms)"])
+        # trace_dur = float(recording_params["trace dur (ms)"]) # Not strictly needed if calculated from inter_stim
+    except KeyError as e:
+        print(f"      Missing recording parameter: {e}")
+        return
+
+    def get_time_idx(ms):
+        return int(ms / acq_time)
+
+    # 3. Filter Data (Butterworth)
+    fs = 1 / (acq_time / 1000)
+
+    def butter_lowpass_filter(data, cutoff, fs, order=5):
+        nyquist = 0.5 * fs
+        normal_cutoff = cutoff / nyquist
+        b, a = butter(order, normal_cutoff, btype="low", analog=False)
+        return filtfilt(b, a, data)
+
+    dict_data_filtered = {}
+    for fname, df in dict_data_signal.items():
+        df_filt = df.copy()
+        for col in df_filt.columns:
+            df_filt[col] = butter_lowpass_filter(df_filt[col], butter_cutoff, fs)
+        dict_data_filtered[fname] = df_filt
+
+    # 4. Get Start/End Indices for Traces
+    idx_first_stim = get_time_idx(first_stim_time)
+    idx_offset = get_time_idx(trace_start_offset)
+    idx_start_first_stim = idx_first_stim - idx_offset
+    idx_dur_stim = get_time_idx(inter_stim_dur)
+
+    stim_indices = []
+    for i in range(num_stim):
+        start = idx_start_first_stim + (i * idx_dur_stim)
+        end = start + idx_dur_stim
+        stim_indices.append((start, end))
+
+    # 5. Calculate Amplitudes & Classify Success (SD)
+    # We need per ROI:
+    #  - Release Prob
+    #  - Weighted Mean Amp
+    #  - Histogram data (bin centers, counts, success counts, fail counts)
+
+    # Structures to hold results for exporting
+    export_data_rel_prob = []
+    export_data_w_mean_amp = []
+
+    idx_baseline_end = get_time_idx(baseline_dur)
+    idx_max_start = get_time_idx(trace_start_offset)
+    idx_max_end = get_time_idx(trace_start_offset + max_value_dur)
+
+    for roi in list_ROIs:
+        roi_events = []  # List of (amp, is_success)
+        roi_traces_info = {}  # fname -> {traces: [], amps: [], success: [], baselines: [], maxs: []}
+
+        # 1. Gather Data & Classify
+        for fname in VIDEO_CSV_FILES:
+            if fname not in dict_data_filtered: continue
+
+            df_sig = dict_data_filtered[fname]
+            roi_sig = df_sig[roi].values
+
+            # Baseline SD
+            baseline_sds = []
+            for (start, _) in stim_indices:
+                baseline_seg = roi_sig[start: start + idx_baseline_end]
+                baseline_sds.append(np.std(baseline_seg))
+
+            if not baseline_sds:
+                continue
+
+            mean_sd = np.mean(baseline_sds)
+            threshold = 3 * mean_sd
+
+            file_traces = []
+            file_amps = []
+            file_success = []
+            file_baselines = []  # Need for plotting (hlines)
+            file_maxs = []  # Need for plotting (hlines)
+
+            for (start, end) in stim_indices:
+                trace_seg = roi_sig[start:end]
+                file_traces.append(trace_seg)
+
+                b_seg = roi_sig[(start):(start + idx_baseline_end)]
+                baseline_val = np.max(b_seg) if len(b_seg) > 0 else 0
+
+                m_seg = roi_sig[(start + idx_max_start):(start + idx_max_end)]
+                max_val = np.max(m_seg) if len(m_seg) > 0 else 0
+
+                amp = max_val - baseline_val
+                is_success = (amp >= threshold)
+
+                file_amps.append(amp)
+                file_success.append(is_success)
+                file_baselines.append(baseline_val)
+                file_maxs.append(max_val)
+
+                roi_events.append((amp, is_success))
+
+            roi_traces_info[fname] = {
+                "traces": file_traces,
+                "amps": file_amps,
+                "success": file_success,
+                "baselines": file_baselines,
+                "maxs": file_maxs,
+                "baseline_sd_val": mean_sd,  # needed for plotting line
+                "threshold_val": threshold  # needed for plotting line
+            }
+
+        # 2. Binning & Stats
+        all_amps = [x[0] for x in roi_events]
+        if not all_amps: continue
+
+        counts, bin_edges = np.histogram(all_amps, bins=20)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+        counts_success = np.zeros_like(counts)
+        counts_failures = np.zeros_like(counts)
+
+        # Assign events to bins
+        inds = np.digitize(all_amps, bin_edges)
+
+        for (amp, is_succ), bin_idx in zip(roi_events, inds):
+            # bin_idx is 1-based index of bin_edges.
+            idx = bin_idx - 1
+            if idx >= len(counts): idx = len(counts) - 1
+            if idx < 0: idx = 0
+
+            if is_succ:
+                counts_success[idx] += 1
+            else:
+                counts_failures[idx] += 1
+
+        sum_success = np.sum(counts_success)
+        sum_failures = np.sum(counts_failures)
+        rel_prob = sum_success / (sum_success + sum_failures) if (sum_success + sum_failures) > 0 else 0
+
+        weighted_sum_amp = np.sum(bin_centers * counts_success)
+        w_mean_amp = weighted_sum_amp / sum_success if sum_success > 0 else np.nan
+
+        # Store for Excel
+        export_data_rel_prob.append([roi, rel_prob])
+        export_data_w_mean_amp.append([roi, w_mean_amp])
+
+        # 3. Plotting
+        # Figure setup: (num_files + 2) rows.
+        num_files = len(roi_traces_info)
+        fig, axs = plt.subplots(num_files + 2, 1, figsize=(10, 20))
+
+        # Plot Histogram (Row 0 & 1)
+        bin_width = bin_centers[1] - bin_centers[0]
+
+        # Row 0: Frequency
+        axs[0].bar(bin_centers, counts, width=bin_width, color="lightgrey")
+        axs[0].set_xlabel("Signal Intensity")
+        axs[0].set_ylabel("Frequency")
+
+        # Row 1: Breakdown
+        axs[1].bar(bin_centers, counts_failures, width=bin_width, color="blue", label='failures')
+        axs[1].bar(bin_centers, counts_success, width=bin_width, color="orange", bottom=counts_failures,
+                   label='success')
+        axs[1].legend(loc="upper right")
+        axs[1].text(0.02, 0.95,
+                    f"release prob= {rel_prob:.2f}\nweighted mean amplitude= {w_mean_amp:.2f}",
+                    transform=axs[1].transAxes, verticalalignment='top', bbox=dict(facecolor='white', alpha=0.5))
+        axs[1].set_xlabel("Signal Intensity")
+        axs[1].set_ylabel("Frequency")
+
+        # Traces (Rows 2 to N)
+        plot_idx = 2
+        for fname in VIDEO_CSV_FILES:
+            if fname not in roi_traces_info: continue
+
+            info = roi_traces_info[fname]
+            ax = axs[plot_idx]
+            plot_idx += 1
+
+            # Plot traces
+            for i, trace in enumerate(info["traces"]):
+                # Time
+                start_idx = stim_indices[i][0]
+                time_arr = np.arange(start_idx * acq_time, (start_idx * acq_time) + (len(trace) * acq_time), acq_time)
+                time_arr = time_arr[:len(trace)]
+
+                # Color
+                N = len(info["traces"])
+                cmap = plt.colormaps.get_cmap('Dark2')
+                colormap = cmap(np.linspace(0, 1, N))
+                color = colormap[i]
+
+                ax.plot(time_arr, trace, color=color)
+
+                # Lines
+                t_start = time_arr[0]
+                t_base_end = t_start + baseline_dur
+                t_max_start = t_start + trace_start_offset
+                t_max_end = t_max_start + max_value_dur
+
+                ax.hlines(info["baselines"][i], t_start, t_base_end, color="black")
+                ax.hlines(info["maxs"][i], t_max_start, t_max_end, color="black")
+
+                # SD Lines (Dashed)
+                mean_sd = info["baseline_sd_val"]
+                thresh = info["threshold_val"]
+                base = info["baselines"][i]
+
+                ax.hlines(mean_sd + base, t_start, t_base_end, color="black", linestyles='dashed')
+                ax.hlines(thresh + base, t_start, t_base_end, color="black", linestyles='dashed')
+
+            ax.set_xlabel("time (ms)")
+            ax.set_ylabel("Signal Intensity")
+            ax.set_title(f"{fname}")
+
+        # Title
+        plt.suptitle(f"Block: {block_name}; ROI: {roi}", y=0.98)
+        plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.98])
+
+        # Save
+        save_path = os.path.join(output_dir, f"{block_name}_{roi}.png")
+        plt.savefig(save_path)
+        plt.close(fig)
+        print(f"      Saved figure for ROI {roi}")
+
+    # 4. Export Excel
+    df_rel = pd.DataFrame(export_data_rel_prob, columns=['ROI', 'release_probability'])
+    df_rel.to_excel(os.path.join(output_dir, f"{block_name}_release_probability.xlsx"), index=False)
+
+    df_wma = pd.DataFrame(export_data_w_mean_amp, columns=['ROI', 'weighted_mean_amplitude'])
+    df_wma.to_excel(os.path.join(output_dir, f"{block_name}_weighted_mean_amplitude.xlsx"), index=False)
+
+    print("    Analysis completed.")
+
+
+def process_block(block_path, output_folder_ROIs, recording_params, block_name):
+    """
+    Processes a single block folder ("A", "B", etc).
+    """
+    block_name = os.path.basename(block_path)
+    output_block_folder = os.path.join(output_folder_ROIs, block_name)
+    os.makedirs(output_block_folder, exist_ok=True)
+
+    print(f"  Processing block: {block_name}")
+
+    # 1. Diff Image from ap1+train.tif
+    ap1_path = os.path.join(block_path, "ap1+train.tif")
+    diff_path = os.path.join(output_block_folder, "diff.tif")
+
+    if not os.path.exists(ap1_path):
+        print(f"    Warning: {ap1_path} not found. Skipping block.")
+        return
+
+    if not calculate_diff_image(ap1_path, diff_path):
+        return
+
+    """
+    # 2. Detect ROIs using ImageJ
+    roi_zip_path = os.path.join(output_block_folder, "RoiSet.zip")
+    if not get_rois_fiji(diff_path, roi_zip_path, ij):
+        return
+
+    # 3. Extract Intensities (Measure) from all 5 videos
+    generated_csvs = []
+
+    for vid_file in VIDEO_FILES:
+        vid_path = os.path.join(block_path, vid_file)
+        csv_name = vid_file.replace(".tif", ".csv")
+        csv_output_path = os.path.join(output_block_folder, csv_name)
+
+        if not os.path.exists(vid_path):
+            print(f"    Video {vid_path} missing. Skipping.")
+            continue
+
+        if ij:
+            # Macro: open video, open ROIs, measure (Multi Measure), save results
+            macro_measure = f###
+            open("{vid_path.replace(os.sep, '/')}");
+            roiManager("Open", "{roi_zip_path.replace(os.sep, '/')}");
+            run("Set Measurements...", "mean redirect=None decimal=3");
+            roiManager("Multi Measure");
+            saveAs("Results", "{csv_output_path.replace(os.sep, '/')}");
+            run("Close"); // Close Results window
+            close(); // Close Image
+            roiManager("Delete"); // Clear ROIs for next run
+            ###
+            try:
+                ij.py.run_macro(macro_measure)
+                if os.path.exists(csv_output_path):
+                    generated_csvs.append(csv_name)
+            except Exception as e:
+                print(f"    Error extracting intensities for {vid_file}: {e}")
+    """
+    # use manual csv
+    generated_csvs = []
+    for vid_file in VIDEO_FILES:
+        #vid_path = os.path.join(block_path, vid_file)
+        csv_name = vid_file.replace(".tif", ".csv")
+        #csv_output_path = os.path.join(output_block_folder, csv_name)
+        generated_csvs.append(csv_name)
+
+    # 4. Run Analysis if CSVs were generated
+    if generated_csvs:
+        run_analysis(block_path, recording_params, output_folder_ROIs, block_name)
+
 
 
 def iGluSnFr_eval():
@@ -32,29 +430,51 @@ def iGluSnFr_eval():
     os.makedirs(output_folder_results, exist_ok=True)
 
     output_folder_ROIs = os.path.join(output_folder, "ROIs")
-    os.makedirs(output_folder_traces, exist_ok=True)
+    # Fix typo in original main.py: output_folder_traces -> output_folder_ROIs
+    os.makedirs(output_folder_ROIs, exist_ok=True)
 
     output_folder_used_data_and_code = os.path.join(output_folder, "used_data_and_code")
     os.makedirs(output_folder_used_data_and_code, exist_ok=True)
 
     # --- Load Metadata ---
-    metadata_df = pd.read_excel(config.METADATA_FILE)
-    # save used data
-    metadata_df.to_excel(os.path.join(output_folder_used_data_and_code, "my_data.xlsx"), index=False)
+    # Use read_excel as per user description, though previous code used read_csv in Image class.
+    # User specified .xlsx file in description.
+    try:
+        metadata_df = pd.read_excel(config.METADATA_FILE)
+        # Also save copy of metadata
+        metadata_df.to_excel(os.path.join(output_folder_used_data_and_code, "my_data.xlsx"), index=False)
+    except Exception as e:
+        print(f"Error loading metadata file {config.METADATA_FILE}: {e}")
+        return
 
-        # === GIT SAVE ===
-    # Provide the current script path (only works in .py, not notebooks)
+    # === GIT SAVE ===
     script_path = __file__ if '__file__' in globals() else None
     myGit.save_git_info(output_folder_used_data_and_code, script_path)
-
-    # --- Results Storage ---
-    results = []
-
 
     # --- Process Each Experiment ---
     for experiment_count, row in metadata_df.iterrows():
         experimentName = row['experimentName']
         print(f"Processing experiment {experiment_count + 1}: {experimentName}")
+
+        # Extract recording parameters for this experiment
+        recording_params = row.to_dict()
+
+        # Locate Experiment Folder
+        exp_folder_path = os.path.join(config.EXTERNAL_DATA_FOLDER, str(experimentName))
+
+        if not os.path.exists(exp_folder_path):
+            print(f"  Experiment folder not found: {exp_folder_path}")
+            continue
+
+        # Iterate over subfolders (Blocks: "A", "B", etc.)
+        # We assume all directories in the experiment folder are blocks
+        for block_name in sorted(os.listdir(exp_folder_path)):
+            block_path = os.path.join(exp_folder_path, block_name)
+            if os.path.isdir(block_path):
+                # You might want to filter for specific block names if needed,
+                # e.g., if len(block_name) == 1:
+                process_block(block_path, output_folder_ROIs, recording_params,block_name)
+
 
 
 if __name__ == '__main__':
