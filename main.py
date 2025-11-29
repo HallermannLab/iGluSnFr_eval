@@ -13,17 +13,60 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
+import struct
+from matplotlib.patches import Rectangle, Polygon
 
 from scipy.signal import butter, filtfilt
 from scipy.optimize import curve_fit
 
 import git_save as myGit
 from skimage import io
-#import zipfile
+import zipfile
 
 
 VIDEO_FILES = ["ap1+train.tif", "ap2.tif", "ap3.tif", "ap4.tif", "ap5.tif"]
+
+
+def read_imagej_roi_zip(zip_path):
+    """
+    Parses an ImageJ ROI zip file and returns a dictionary of ROI data.
+    Keys are the ROI names (filename without extension).
+    """
+    rois = {}
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            if name.endswith('.roi'):
+                try:
+                    data = zf.read(name)
+                    # Parse header based on ImageJ ROI format
+                    # byte 6-7: top, 8-9: left, 10-11: bottom, 12-13: right
+                    top, left, bottom, right = struct.unpack_from('>hhhh', data, 6)
+                    n_coords = struct.unpack_from('>h', data, 42)[0]
+                    roi_type = struct.unpack_from('b', data, 32)[0]
+
+                    roi_name = os.path.splitext(os.path.basename(name))[0]
+
+                    roi_data = {
+                        'top': top, 'left': left, 'bottom': bottom, 'right': right,
+                        'type': roi_type,
+                        'n_coords': n_coords
+                    }
+
+                    # If polygon (0), freehand (7), traced (8), polyline (5), freeline (4), angle (10), point (10)
+                    # Read coordinates
+                    if roi_type in [0, 3, 4, 5, 7, 8, 10] and n_coords > 0:
+                        # Coordinates start at 64
+                        format_str = '>' + 'h' * n_coords
+                        x_rel = struct.unpack_from(format_str, data, 64)
+                        y_rel = struct.unpack_from(format_str, data, 64 + 2 * n_coords)
+
+                        roi_data['x_points'] = [x + left for x in x_rel]
+                        roi_data['y_points'] = [y + top for y in y_rel]
+
+                    rois[roi_name] = roi_data
+                except Exception as e:
+                    print(f"Warning: Failed to parse ROI {name}: {e}")
+    return rois
 
 
 def calculate_diff_image(tif_path, output_path):
@@ -70,6 +113,26 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
     # Ensure output directory exists
     output_dir = output_folder_ROIs
     os.makedirs(output_dir, exist_ok=True)
+
+    # 0. Check for ROIs.zip and Diff Image
+    rois_path = os.path.join(block_path, "ROIs.zip")
+    rois_data = {}
+    if os.path.exists(rois_path):
+        try:
+            rois_data = read_imagej_roi_zip(rois_path)
+            print(f"      Loaded {len(rois_data)} ROIs from {rois_path}")
+        except Exception as e:
+            print(f"      Failed to load ROIs: {e}")
+
+    diff_img = None
+    if rois_data:
+        # Diff image is expected to be in the block subfolder of output_folder_ROIs
+        diff_path = os.path.join(output_folder_ROIs, block_name, "diff.tif")
+        if os.path.exists(diff_path):
+            try:
+                diff_img = io.imread(diff_path)
+            except Exception as e:
+                print(f"      Failed to load diff image: {e}")
 
     # 1. Load Data
     dict_data_signal = {}
@@ -167,7 +230,6 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
     for roi in list_ROIs:
         roi_events = []  # List of (amp, is_success)
         roi_traces_info = {}  # fname -> {traces: [], amps: [], success: [], baselines: [], maxs: []}
-
         # 1. Gather Data & Classify
         for fname in VIDEO_CSV_FILES:
             if fname not in dict_data_filtered: continue
@@ -259,36 +321,130 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
         export_data_w_mean_amp.append([roi, w_mean_amp])
 
         # 3. Plotting
-        # Figure setup: (num_files + 2) rows.
-        num_files = len(roi_traces_info)
-        fig, axs = plt.subplots(num_files + 2, 1, figsize=(10, 20))
+        # Determine layout based on whether we have ROI images to show
 
-        # Plot Histogram (Row 0 & 1)
+        # Robust ROI matching
+        current_roi_data = rois_data.get(roi)
+        if current_roi_data is None:
+            # Try string
+            s_roi = str(roi)
+            current_roi_data = rois_data.get(s_roi)
+
+            # Try removing "Mean"
+            if current_roi_data is None and s_roi.startswith("Mean"):
+                short_roi = s_roi.replace("Mean", "")
+                current_roi_data = rois_data.get(short_roi)
+                s_roi = short_roi  # update for next numeric check
+
+            # Try numeric matching against 0001-xxxx style keys
+            if current_roi_data is None:
+                try:
+                    roi_num = int(s_roi)
+                    for k, v in rois_data.items():
+                        k_part = k.split('-')[0]
+                        try:
+                            if int(k_part) == roi_num:
+                                current_roi_data = v
+                                break
+                        except:
+                            continue
+                except:
+                    pass
+
+        show_roi_images = (current_roi_data is not None) and (diff_img is not None)
+
+        # Rows: Optional Image Row + 2 Histogram Rows + N Trace Rows
+        extra_rows = 1 if show_roi_images else 0
+        num_files = len(roi_traces_info)
+        total_rows = num_files + 2 + extra_rows
+
+        fig = plt.figure(figsize=(10, 20 + (5 if show_roi_images else 0)))
+        gs = fig.add_gridspec(total_rows, 2)
+
+        row_offset = 0
+
+        # Plot ROI Images (Row 0)
+        if show_roi_images:
+            # Diff Image with ROI Highlight
+            ax_diff = fig.add_subplot(gs[0, 0])
+            ax_diff.imshow(diff_img, cmap='gray')
+
+            # Draw ROI
+            if 'x_points' in current_roi_data:
+                # Polygon
+                points = list(zip(current_roi_data['x_points'], current_roi_data['y_points']))
+                poly = Polygon(points, edgecolor='yellow', facecolor='none', linewidth=1)
+                ax_diff.add_patch(poly)
+            else:
+                # Rectangle
+                rect = Rectangle((current_roi_data['left'], current_roi_data['top']),
+                                 current_roi_data['right'] - current_roi_data['left'],
+                                 current_roi_data['bottom'] - current_roi_data['top'],
+                                 edgecolor='yellow', facecolor='none', linewidth=1)
+                ax_diff.add_patch(rect)
+
+            ax_diff.set_title("Diff Image with ROI")
+            ax_diff.axis('off')
+
+            # Zoom Image
+            ax_zoom = fig.add_subplot(gs[0, 1])
+
+            # Calculate center
+            cx = (current_roi_data['left'] + current_roi_data['right']) / 2
+            cy = (current_roi_data['top'] + current_roi_data['bottom']) / 2
+
+            # Get ZoomSize
+            try:
+                zoom_size = float(recording_params.get('ZoomSize', 40))
+            except:
+                zoom_size = 40
+
+            half_size = zoom_size / 2
+
+            # Crop coordinates (handle boundaries)
+            h, w = diff_img.shape
+            x_start = int(max(0, cx - half_size))
+            x_end = int(min(w, cx + half_size))
+            y_start = int(max(0, cy - half_size))
+            y_end = int(min(h, cy + half_size))
+
+            if x_start < x_end and y_start < y_end:
+                zoom_crop = diff_img[y_start:y_end, x_start:x_end]
+                ax_zoom.imshow(zoom_crop, cmap='gray')
+
+            ax_zoom.set_title(f"Zoom (Size: {zoom_size})")
+            ax_zoom.axis('off')
+
+            row_offset = 1
+
+        # Plot Histogram (Row 0/1 & 1/2)
         bin_width = bin_centers[1] - bin_centers[0]
 
-        # Row 0: Frequency
-        axs[0].bar(bin_centers, counts, width=bin_width, color="lightgrey")
-        axs[0].set_xlabel("Signal Intensity")
-        axs[0].set_ylabel("Frequency")
+        # Frequency
+        ax_hist1 = fig.add_subplot(gs[row_offset, :])
+        ax_hist1.bar(bin_centers, counts, width=bin_width, color="lightgrey")
+        ax_hist1.set_xlabel("Signal Intensity")
+        ax_hist1.set_ylabel("Frequency")
 
-        # Row 1: Breakdown
-        axs[1].bar(bin_centers, counts_failures, width=bin_width, color="blue", label='failures')
-        axs[1].bar(bin_centers, counts_success, width=bin_width, color="orange", bottom=counts_failures,
-                   label='success')
-        axs[1].legend(loc="upper right")
-        axs[1].text(0.02, 0.95,
-                    f"release prob= {rel_prob:.2f}\nweighted mean amplitude= {w_mean_amp:.2f}",
-                    transform=axs[1].transAxes, verticalalignment='top', bbox=dict(facecolor='white', alpha=0.5))
-        axs[1].set_xlabel("Signal Intensity")
-        axs[1].set_ylabel("Frequency")
+        # Breakdown
+        ax_hist2 = fig.add_subplot(gs[row_offset + 1, :])
+        ax_hist2.bar(bin_centers, counts_failures, width=bin_width, color="blue", label='failures')
+        ax_hist2.bar(bin_centers, counts_success, width=bin_width, color="orange", bottom=counts_failures,
+                     label='success')
+        ax_hist2.legend(loc="upper right")
+        ax_hist2.text(0.02, 0.95,
+                      f"release prob= {rel_prob:.2f}\nweighted mean amplitude= {w_mean_amp:.2f}",
+                      transform=ax_hist2.transAxes, verticalalignment='top', bbox=dict(facecolor='white', alpha=0.5))
+        ax_hist2.set_xlabel("Signal Intensity")
+        ax_hist2.set_ylabel("Frequency")
 
-        # Traces (Rows 2 to N)
+        # Traces (Rows 2+ to N)
         plot_idx = 2
         for fname in VIDEO_CSV_FILES:
             if fname not in roi_traces_info: continue
 
             info = roi_traces_info[fname]
-            ax = axs[plot_idx]
+            ax = fig.add_subplot(gs[row_offset + plot_idx, :])
             plot_idx += 1
 
             # Plot traces
@@ -405,6 +561,7 @@ def process_block(block_path, output_folder_ROIs, recording_params, block_name):
             except Exception as e:
                 print(f"    Error extracting intensities for {vid_file}: {e}")
     """
+
     # use manual csv
     generated_csvs = []
     for vid_file in VIDEO_FILES:
@@ -413,10 +570,9 @@ def process_block(block_path, output_folder_ROIs, recording_params, block_name):
         #csv_output_path = os.path.join(output_block_folder, csv_name)
         generated_csvs.append(csv_name)
 
-    # 4. Run Analysis if CSVs were generated
+    # 4. Run Analysis
     if generated_csvs:
         run_analysis(block_path, recording_params, output_folder_ROIs, block_name)
-
 
 
 def iGluSnFr_eval():
