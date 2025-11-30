@@ -29,20 +29,19 @@ from read_roi import read_roi_zip
 VIDEO_FILES = ["ap1+train.tif", "ap2.tif", "ap3.tif", "ap4.tif", "ap5.tif"]
 
 
-def calculate_diff_image(tif_path, output_path):
+def calculate_diff_image(tif_path, output_path, recording_params):
     """
     Calculates difference image (Stim - Baseline) similar to the notebook logic.
     """
     try:
         img = io.imread(tif_path)
 
-        # Frames from notebook: BL 410-415, Stim 365-375.
-        # NOTE: These frames seem hardcoded in the user example.
-        # Ensure these match the 'ap1+train.tif' structure for all experiments.
-        Start_BL = 410
-        End_BL = 415
-        Start_Stim = 365
-        End_Stim = 375
+        # Convert ms to frame numbers using acquisition time
+        acq_time = float(recording_params["acquisition time (ms)"])
+        Start_BL = int(float(recording_params["Diff_BL_Start"]) / acq_time)
+        End_BL = int(float(recording_params["Diff_BL_End"]) / acq_time)
+        Start_Stim = int(float(recording_params["Diff_Stim_Start"]) / acq_time)
+        End_Stim = int(float(recording_params["Diff_Stim_End"]) / acq_time)
 
         # Safety check for frame indices
         if img.shape[0] <= max(Start_BL, End_BL, Start_Stim, End_Stim):
@@ -64,7 +63,7 @@ def calculate_diff_image(tif_path, output_path):
         return False
 
 
-def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
+def run_analysis(block_path, recording_params, output_folder_ROIs, block_name,diff_image_path_and_name):
     print(f"    Running analysis for block: {block_name}")
 
     # Constants / Config
@@ -87,11 +86,9 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
 
     diff_img = None
     if rois_data:
-        # Diff image is expected to be in the block subfolder of output_folder_ROIs
-        diff_path = os.path.join(output_folder_ROIs, block_name, "diff.tif")
-        if os.path.exists(diff_path):
+        if os.path.exists(diff_image_path_and_name):
             try:
-                diff_img = io.imread(diff_path)
+                diff_img = io.imread(diff_image_path_and_name)
             except Exception as e:
                 print(f"      Failed to load diff image: {e}")
 
@@ -124,7 +121,7 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
 
     if not files_found:
         print("      No CSV files found. Aborting analysis.")
-        return
+        return [], []
 
     # 2. Pre-calculations & Constants
     try:
@@ -139,9 +136,12 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
         first_stim_time = float(recording_params["first stim timepoint (ms)"])
         inter_stim_dur = float(recording_params["inter stimulus dur (ms)"])
         # trace_dur = float(recording_params["trace dur (ms)"]) # Not strictly needed if calculated from inter_stim
+        train_plot_start = float(recording_params.get("trainPlotStart", 0))
+        train_plot_end = float(recording_params.get("trainPlotEnd", 2000))
+
     except KeyError as e:
         print(f"      Missing recording parameter: {e}")
-        return
+        return [], []
 
     def get_time_idx(ms):
         return int(ms / acq_time)
@@ -157,10 +157,13 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
 
     dict_data_filtered = {}
     for fname, df in dict_data_signal.items():
-        df_filt = df.copy()
-        for col in df_filt.columns:
-            df_filt[col] = butter_lowpass_filter(df_filt[col], butter_cutoff, fs)
-        dict_data_filtered[fname] = df_filt
+        if butter_cutoff == 0:
+            dict_data_filtered[fname] = df
+        else:
+            df_filt = df.copy()
+            for col in df_filt.columns:
+                df_filt[col] = butter_lowpass_filter(df_filt[col], butter_cutoff, fs)
+            dict_data_filtered[fname] = df_filt
 
     # 4. Get Start/End Indices for Traces
     idx_first_stim = get_time_idx(first_stim_time)
@@ -284,6 +287,10 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
         # 3. Plotting
         current_roi_data = rois_data.get(roi)
 
+        # Determine if we plot the specific Train Trace
+        train_trace_key = "ap1+train.csv"
+        show_train_trace = train_trace_key in roi_traces_info
+
         if current_roi_data is None:
             s = str(roi)
 
@@ -295,14 +302,15 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
 
             current_roi_data = rois_data.get(base)
 
-        show_roi_images = (current_roi_data is not None) and (diff_img is not None)
+            show_roi_images = (current_roi_data is not None) and (diff_img is not None)
 
-        # Rows: Optional Image Row + 2 Histogram Rows + N Trace Rows
+        # Rows: Optional Image Row + Optional Train Trace Row + 2 Histogram Rows + N Trace Rows
         extra_rows = 1 if show_roi_images else 0
+        train_row = 1 if show_train_trace else 0
         num_files = len(roi_traces_info)
-        total_rows = num_files + 2 + extra_rows
+        total_rows = num_files + 2 + extra_rows + train_row
 
-        fig = plt.figure(figsize=(10, 20 + (5 if show_roi_images else 0)))
+        fig = plt.figure(figsize=(10, 20 + (5 if show_roi_images else 0) + (2 if show_train_trace else 0)))
         gs = fig.add_gridspec(total_rows, 2)
 
         row_offset = 0
@@ -421,6 +429,31 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
 
             row_offset = 1
 
+        # Plot Train Trace (Row 1 or 0)
+        if show_train_trace:
+            ax_train = fig.add_subplot(gs[row_offset, :])
+
+            # Get data
+            # We access the filtered data dictionary directly to get the full trace for this ROI
+            if train_trace_key in dict_data_filtered:
+                #full_trace = dict_data_filtered[train_trace_key][roi].values
+                full_trace = dict_data_signal[train_trace_key][roi].values
+
+                # Time axis
+                t_axis = np.arange(0, len(full_trace) * acq_time, acq_time)
+                # Truncate if size mismatch slightly
+                t_axis = t_axis[:len(full_trace)]
+
+                ax_train.plot(t_axis, full_trace, color='black')
+
+                # Set limits
+                ax_train.set_xlim(train_plot_start, train_plot_end)
+                ax_train.set_title("Train Trace (Zoomed)")
+                ax_train.set_xlabel("time (ms)")
+                ax_train.set_ylabel("Signal")
+
+            row_offset += 1
+
         # Plot Histogram (Row 0/1 & 1/2)
         bin_width = bin_centers[1] - bin_centers[0]
 
@@ -492,47 +525,53 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
         plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.98])
 
         # Save
-        save_path = os.path.join(output_dir, f"{block_name}_{roi}.pdf")
+        save_path = os.path.join(output_dir, f"{roi}_{block_name}.pdf")
         plt.savefig(save_path)
         plt.close(fig)
         print(f"      Saved figure for ROI {roi}")
 
     # 4. Export Excel
-    df_rel = pd.DataFrame(export_data_rel_prob, columns=['ROI', 'release_probability'])
-    df_rel.to_excel(os.path.join(output_dir, f"{block_name}_release_probability.xlsx"), index=False)
+    #df_rel = pd.DataFrame(export_data_rel_prob, columns=['ROI', 'release_probability'])
+    #df_rel.to_excel(os.path.join(output_dir, f"{block_name}_release_probability.xlsx"), index=False)
 
-    df_wma = pd.DataFrame(export_data_w_mean_amp, columns=['ROI', 'weighted_mean_amplitude'])
-    df_wma.to_excel(os.path.join(output_dir, f"{block_name}_weighted_mean_amplitude.xlsx"), index=False)
+    #df_wma = pd.DataFrame(export_data_w_mean_amp, columns=['ROI', 'weighted_mean_amplitude'])
+    #df_wma.to_excel(os.path.join(output_dir, f"{block_name}_weighted_mean_amplitude.xlsx"), index=False)
 
     print("    Analysis completed.")
 
+    return export_data_rel_prob, export_data_w_mean_amp
 
-def process_block(block_path, output_folder_ROIs, recording_params, block_name):
+
+def process_block(block_path, output_folder_experiment, recording_params):
     """
     Processes a single block folder ("A", "B", etc).
     """
     block_name = os.path.basename(block_path)
-    output_block_folder = os.path.join(output_folder_ROIs, block_name)
-    os.makedirs(output_block_folder, exist_ok=True)
+
+    output_folder_ROIs = os.path.join(output_folder_experiment, "ROIs")
+    os.makedirs(output_folder_ROIs, exist_ok=True)
+
+    output_folder_DiffImage = os.path.join(output_folder_experiment, "DiffImage")
+    os.makedirs(output_folder_DiffImage, exist_ok=True)
 
     print(f"  Processing block: {block_name}")
 
     # 1. Diff Image from ap1+train.tif
     ap1_path = os.path.join(block_path, "ap1+train.tif")
-    diff_path = os.path.join(output_block_folder, "diff.tif")
+    diff_image_path_and_name = os.path.join(output_folder_DiffImage, f"{block_name}_diff.tif")
 
     if not os.path.exists(ap1_path):
         print(f"    Warning: {ap1_path} not found. Skipping block.")
-        return
+        return [], []
 
-    if not calculate_diff_image(ap1_path, diff_path):
-        return
+    if not calculate_diff_image(ap1_path, diff_image_path_and_name, recording_params):
+        return [], []
 
     """
     # 2. Detect ROIs using ImageJ
     roi_zip_path = os.path.join(output_block_folder, "RoiSet.zip")
-    if not get_rois_fiji(diff_path, roi_zip_path, ij):
-        return
+    if not get_rois_fiji(diff_image_path_and_name, roi_zip_path, ij):
+        return [], []
 
     # 3. Extract Intensities (Measure) from all 5 videos
     generated_csvs = []
@@ -576,7 +615,9 @@ def process_block(block_path, output_folder_ROIs, recording_params, block_name):
 
     # 4. Run Analysis
     if generated_csvs:
-        run_analysis(block_path, recording_params, output_folder_ROIs, block_name)
+        export_data_rel_prob, export_data_w_mean_amp = run_analysis(block_path, recording_params, output_folder_ROIs, block_name, diff_image_path_and_name)
+
+    return export_data_rel_prob, export_data_w_mean_amp
 
 
 def iGluSnFr_eval():
@@ -585,13 +626,6 @@ def iGluSnFr_eval():
     timestamp = datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     output_folder = os.path.join(config.ROOT_FOLDER, f"output_{config.MY_INITIAL}_{timestamp}")
     os.makedirs(output_folder, exist_ok=True)
-
-    output_folder_results = os.path.join(output_folder, "results")
-    os.makedirs(output_folder_results, exist_ok=True)
-
-    output_folder_ROIs = os.path.join(output_folder, "ROIs")
-    # Fix typo in original main.py: output_folder_traces -> output_folder_ROIs
-    os.makedirs(output_folder_ROIs, exist_ok=True)
 
     output_folder_used_data_and_code = os.path.join(output_folder, "used_data_and_code")
     os.makedirs(output_folder_used_data_and_code, exist_ok=True)
@@ -622,9 +656,19 @@ def iGluSnFr_eval():
         # Locate Experiment Folder
         exp_folder_path = os.path.join(config.EXTERNAL_DATA_FOLDER, str(experimentName))
 
+        output_folder_experiment = os.path.join(output_folder, experimentName)
+        os.makedirs(output_folder_experiment, exist_ok=True)
+
+        output_folder_results = os.path.join(output_folder_experiment, "results")
+        os.makedirs(output_folder_results, exist_ok=True)
+
         if not os.path.exists(exp_folder_path):
             print(f"  Experiment folder not found: {exp_folder_path}")
             continue
+
+        # Accumulate results for this experiment
+        exp_rel_prob_df = pd.DataFrame()
+        exp_wma_df = pd.DataFrame()
 
         # Iterate over subfolders (Blocks: "A", "B", etc.)
         # We assume all directories in the experiment folder are blocks
@@ -633,9 +677,35 @@ def iGluSnFr_eval():
             if os.path.isdir(block_path):
                 # You might want to filter for specific block names if needed,
                 # e.g., if len(block_name) == 1:
-                process_block(block_path, output_folder_ROIs, recording_params,block_name)
+                rel_data, wma_data = process_block(block_path, output_folder_experiment, recording_params)
 
+                if rel_data:
+                    # Convert list to DataFrame, set column name to Block Name (e.g., "A")
+                    current_rel_df = pd.DataFrame(rel_data, columns=['ROI_number', block_name])
+                    current_rel_df.set_index('ROI_number', inplace=True)
 
+                    if exp_rel_prob_df.empty:
+                        exp_rel_prob_df = current_rel_df
+                    else:
+                        # Join on ROI_number (index) to align ROIs across blocks
+                        exp_rel_prob_df = exp_rel_prob_df.join(current_rel_df, how='outer')
+
+                if wma_data:
+                    current_wma_df = pd.DataFrame(wma_data, columns=['ROI_number', block_name])
+                    current_wma_df.set_index('ROI_number', inplace=True)
+
+                    if exp_wma_df.empty:
+                        exp_wma_df = current_wma_df
+                    else:
+                        exp_wma_df = exp_wma_df.join(current_wma_df, how='outer')
+
+            # Save Experiment Results
+            out_path = os.path.join(output_folder_results, "release_probability.xlsx")
+            # Sort by ROI name, reset index to make ROI_number a column, and don't save the numerical index
+            exp_rel_prob_df.sort_index().reset_index().to_excel(out_path, index=False)
+
+            out_path = os.path.join(output_folder_results, "wheighted_amplitude.xlsx")
+            exp_wma_df.sort_index().reset_index().to_excel(out_path, index=False)
 
 if __name__ == '__main__':
     iGluSnFr_eval()
