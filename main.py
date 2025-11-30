@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import struct
 from matplotlib.patches import Rectangle, Polygon
+from read_roi import read_roi_file
 
 from scipy.signal import butter, filtfilt
 from scipy.optimize import curve_fit
@@ -22,51 +23,10 @@ from scipy.optimize import curve_fit
 import git_save as myGit
 from skimage import io
 import zipfile
+from read_roi import read_roi_zip
 
 
 VIDEO_FILES = ["ap1+train.tif", "ap2.tif", "ap3.tif", "ap4.tif", "ap5.tif"]
-
-
-def read_imagej_roi_zip(zip_path):
-    """
-    Parses an ImageJ ROI zip file and returns a dictionary of ROI data.
-    Keys are the ROI names (filename without extension).
-    """
-    rois = {}
-    with zipfile.ZipFile(zip_path) as zf:
-        for name in zf.namelist():
-            if name.endswith('.roi'):
-                try:
-                    data = zf.read(name)
-                    # Parse header based on ImageJ ROI format
-                    # byte 6-7: top, 8-9: left, 10-11: bottom, 12-13: right
-                    top, left, bottom, right = struct.unpack_from('>hhhh', data, 6)
-                    n_coords = struct.unpack_from('>h', data, 42)[0]
-                    roi_type = struct.unpack_from('b', data, 32)[0]
-
-                    roi_name = os.path.splitext(os.path.basename(name))[0]
-
-                    roi_data = {
-                        'top': top, 'left': left, 'bottom': bottom, 'right': right,
-                        'type': roi_type,
-                        'n_coords': n_coords
-                    }
-
-                    # If polygon (0), freehand (7), traced (8), polyline (5), freeline (4), angle (10), point (10)
-                    # Read coordinates
-                    if roi_type in [0, 3, 4, 5, 7, 8, 10] and n_coords > 0:
-                        # Coordinates start at 64
-                        format_str = '>' + 'h' * n_coords
-                        x_rel = struct.unpack_from(format_str, data, 64)
-                        y_rel = struct.unpack_from(format_str, data, 64 + 2 * n_coords)
-
-                        roi_data['x_points'] = [x + left for x in x_rel]
-                        roi_data['y_points'] = [y + top for y in y_rel]
-
-                    rois[roi_name] = roi_data
-                except Exception as e:
-                    print(f"Warning: Failed to parse ROI {name}: {e}")
-    return rois
 
 
 def calculate_diff_image(tif_path, output_path):
@@ -119,7 +79,8 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
     rois_data = {}
     if os.path.exists(rois_path):
         try:
-            rois_data = read_imagej_roi_zip(rois_path)
+            # Use read_roi library directly
+            rois_data = read_roi_zip(rois_path)
             print(f"      Loaded {len(rois_data)} ROIs from {rois_path}")
         except Exception as e:
             print(f"      Failed to load ROIs: {e}")
@@ -321,35 +282,18 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
         export_data_w_mean_amp.append([roi, w_mean_amp])
 
         # 3. Plotting
-        # Determine layout based on whether we have ROI images to show
-
-        # Robust ROI matching
         current_roi_data = rois_data.get(roi)
+
         if current_roi_data is None:
-            # Try string
-            s_roi = str(roi)
-            current_roi_data = rois_data.get(s_roi)
+            s = str(roi)
 
-            # Try removing "Mean"
-            if current_roi_data is None and s_roi.startswith("Mean"):
-                short_roi = s_roi.replace("Mean", "")
-                current_roi_data = rois_data.get(short_roi)
-                s_roi = short_roi  # update for next numeric check
+            # If the column is named like "Mean(ROI001)" → "ROI001"
+            if s.startswith("Mean(") and s.endswith(")"):
+                base = s[len("Mean("):-1]  # remove "Mean(" and trailing ")"
+            else:
+                base = s
 
-            # Try numeric matching against 0001-xxxx style keys
-            if current_roi_data is None:
-                try:
-                    roi_num = int(s_roi)
-                    for k, v in rois_data.items():
-                        k_part = k.split('-')[0]
-                        try:
-                            if int(k_part) == roi_num:
-                                current_roi_data = v
-                                break
-                        except:
-                            continue
-                except:
-                    pass
+            current_roi_data = rois_data.get(base)
 
         show_roi_images = (current_roi_data is not None) and (diff_img is not None)
 
@@ -365,33 +309,57 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
 
         # Plot ROI Images (Row 0)
         if show_roi_images:
+            # Calculate robust contrast limits (1st and 99th percentiles)
+            vmin, vmax = np.percentile(diff_img, [1, 99])
+
             # Diff Image with ROI Highlight
             ax_diff = fig.add_subplot(gs[0, 0])
-            ax_diff.imshow(diff_img, cmap='gray')
+            ax_diff.imshow(diff_img, cmap='gray', vmin=vmin, vmax=vmax)
 
-            # Draw ROI
-            if 'x_points' in current_roi_data:
-                # Polygon
-                points = list(zip(current_roi_data['x_points'], current_roi_data['y_points']))
-                poly = Polygon(points, edgecolor='yellow', facecolor='none', linewidth=1)
-                ax_diff.add_patch(poly)
-            else:
-                # Rectangle
-                rect = Rectangle((current_roi_data['left'], current_roi_data['top']),
-                                 current_roi_data['right'] - current_roi_data['left'],
-                                 current_roi_data['bottom'] - current_roi_data['top'],
-                                 edgecolor='yellow', facecolor='none', linewidth=1)
-                ax_diff.add_patch(rect)
+            # Draw ROI outline
+            roi_type = current_roi_data['type']
+
+            # Polygon ROI
+            if roi_type == 'polygon':
+                x = current_roi_data['x']
+                y = current_roi_data['y']
+                ax_diff.plot(x + [x[0]], y + [y[0]], linewidth=2, color='yellow')
+
+            # Rectangle ROI
+            elif roi_type == 'rectangle':
+                x = current_roi_data["left"]
+                y = current_roi_data["top"]
+                w = current_roi_data["width"]
+                h = current_roi_data["height"]
+                rect_x = [x, x + w, x + w, x, x]
+                rect_y = [y, y, y + h, y + h, y]
+                ax_diff.plot(rect_x, rect_y, linewidth=2, color='yellow')
+
+            # Oval ROI (approximate with a polygon)
+            elif roi_type == 'oval':
+                rx = current_roi_data["width"] / 2
+                ry = current_roi_data["height"] / 2
+                cx = current_roi_data["left"] + rx
+                cy = current_roi_data["top"] + ry
+                theta = np.linspace(0, 2*np.pi, 200)
+                x = cx + rx * np.cos(theta)
+                y = cy + ry * np.sin(theta)
+                ax_diff.plot(x, y, linewidth=2, color='yellow')
 
             ax_diff.set_title("Diff Image with ROI")
             ax_diff.axis('off')
 
-            # Zoom Image
-            ax_zoom = fig.add_subplot(gs[0, 1])
+            # Zoom Image ------------
+            # Determine ROI type and center for zooming
+            roi_type = current_roi_data['type']
 
-            # Calculate center
-            cx = (current_roi_data['left'] + current_roi_data['right']) / 2
-            cy = (current_roi_data['top'] + current_roi_data['bottom']) / 2
+            if roi_type == 'polygon':
+                cx = np.mean(current_roi_data['x'])
+                cy = np.mean(current_roi_data['y'])
+            else:
+                # Rectangle or Oval
+                cx = current_roi_data['left'] + current_roi_data['width'] / 2
+                cy = current_roi_data['top'] + current_roi_data['height'] / 2
 
             # Get ZoomSize
             try:
@@ -399,21 +367,57 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
             except:
                 zoom_size = 40
 
+            # Calculate zoom limits
             half_size = zoom_size / 2
+            h_img, w_img = diff_img.shape
+            x_start = max(0, cx - half_size)
+            x_end = min(w_img, cx + half_size)
+            y_start = max(0, cy - half_size)
+            y_end = min(h_img, cy + half_size)
 
-            # Crop coordinates (handle boundaries)
-            h, w = diff_img.shape
-            x_start = int(max(0, cx - half_size))
-            x_end = int(min(w, cx + half_size))
-            y_start = int(max(0, cy - half_size))
-            y_end = int(min(h, cy + half_size))
+            # Calculate separate contrast for zoom
+            zoom_slice = diff_img[int(y_start):int(y_end), int(x_start):int(x_end)]
+            if zoom_slice.size > 0:
+                vmin_zoom, vmax_zoom = np.percentile(zoom_slice, [1, 99])
+            else:
+                vmin_zoom, vmax_zoom = vmin, vmax
 
-            if x_start < x_end and y_start < y_end:
-                zoom_crop = diff_img[y_start:y_end, x_start:x_end]
-                ax_zoom.imshow(zoom_crop, cmap='gray')
+            # Zoom Image (Show full image but limit view to create zoom effect)
+            ax_zoom = fig.add_subplot(gs[0, 1])
+            ax_zoom.imshow(diff_img, cmap='gray', vmin=vmin_zoom, vmax=vmax_zoom)
+
+            # Apply Zoom (invert Y for images so smaller Y is at top)
+            ax_zoom.set_xlim(x_start, x_end)
+            ax_zoom.set_ylim(y_end, y_start)
 
             ax_zoom.set_title(f"Zoom (Size: {zoom_size})")
             ax_zoom.axis('off')
+
+            # Draw ROI outline on BOTH axes
+            for ax in [ax_diff, ax_zoom]:
+                if roi_type == 'polygon':
+                    x = current_roi_data['x']
+                    y = current_roi_data['y']
+                    ax.plot(x + [x[0]], y + [y[0]], linewidth=2, color='yellow')
+
+                elif roi_type == 'rectangle':
+                    x = current_roi_data["left"]
+                    y = current_roi_data["top"]
+                    w = current_roi_data["width"]
+                    h = current_roi_data["height"]
+                    rect_x = [x, x + w, x + w, x, x]
+                    rect_y = [y, y, y + h, y + h, y]
+                    ax.plot(rect_x, rect_y, linewidth=2, color='yellow')
+
+                elif roi_type == 'oval':
+                    rx = current_roi_data["width"] / 2
+                    ry = current_roi_data["height"] / 2
+                    cx_ov = current_roi_data["left"] + rx
+                    cy_ov = current_roi_data["top"] + ry
+                    theta = np.linspace(0, 2 * np.pi, 200)
+                    x_ov = cx_ov + rx * np.cos(theta)
+                    y_ov = cy_ov + ry * np.sin(theta)
+                    ax.plot(x_ov, y_ov, linewidth=2, color='yellow')
 
             row_offset = 1
 
@@ -488,7 +492,7 @@ def run_analysis(block_path, recording_params, output_folder_ROIs, block_name):
         plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.98])
 
         # Save
-        save_path = os.path.join(output_dir, f"{block_name}_{roi}.png")
+        save_path = os.path.join(output_dir, f"{block_name}_{roi}.pdf")
         plt.savefig(save_path)
         plt.close(fig)
         print(f"      Saved figure for ROI {roi}")
