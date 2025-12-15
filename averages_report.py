@@ -46,12 +46,15 @@ def save_block_averages_pdf(
     ax1.axis("off")
 
     # Row 1: average full train trace (no analysis)
+    train_plot_start = float(recording_params.get("trainPlotStart", 0))
+    train_plot_end = float(recording_params.get("trainPlotEnd", 2000))
     train_key = "ap1+train.csv"
     ax_train = fig.add_subplot(gs[1, :])
     if train_key in dict_data_signal and not dict_data_signal[train_key].empty:
         y = _avg_trace(dict_data_signal[train_key])
         t = np.arange(len(y)) * acq_time
         ax_train.plot(t, y, color="black", linewidth=1)
+    ax_train.set_xlim(train_plot_start, train_plot_end)
     ax_train.set_xlabel("time (ms)")
     ax_train.set_ylabel("mean ROI intensity")
     ax_train.set_title("Average full train trace across ROIs (no analysis)")

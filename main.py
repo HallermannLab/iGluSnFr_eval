@@ -477,7 +477,7 @@ def process_block(block_path, output_folder_experiment, recording_params):
 
     print(f"  Processing block: {block_name}")
 
-    # --- IMPORTANT: handle special blocks before checking ap1+train.tif ---
+    # --- handle special blocks before checking ap1+train.tif ---
     if is_special:
         ind_path = os.path.join(block_path, "ind.tif")
         if not os.path.exists(ind_path):
