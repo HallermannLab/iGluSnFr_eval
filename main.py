@@ -189,15 +189,19 @@ def run_analysis(
             roi_sig = df_sig[roi].values
 
             baseline_sds = []
+            baseline_maxs = []
+            
             for (start, _) in stim_indices:
                 baseline_seg = roi_sig[start: start + idx_baseline_end]
                 baseline_sds.append(np.std(baseline_seg))
+                baseline_maxs.append(np.max(baseline_seg))
 
-            if not baseline_sds:
-                continue
+            #if not baseline_average_sd:
+            #    continue
 
-            mean_sd = np.mean(baseline_sds)
-            threshold = 3 * mean_sd
+            baseline_average_sd = np.mean(baseline_sds)
+            baseline_average_max = np.mean(baseline_maxs)
+            threshold = 3 * baseline_average_sd
 
             file_traces = []
             file_amps = []
@@ -209,21 +213,23 @@ def run_analysis(
                 trace_seg = roi_sig[start:end]
                 file_traces.append(trace_seg)
 
-                b_seg = roi_sig[start: start + idx_baseline_end]
-                baseline_val = np.max(b_seg) if len(b_seg) > 0 else 0
+                #b_seg = roi_sig[start: start + idx_baseline_end]
+                #baseline_val = np.max(b_seg) if len(b_seg) > 0 else 0
 
                 m_seg = roi_sig[start + idx_max_start: start + idx_max_end]
                 max_val = np.max(m_seg) if len(m_seg) > 0 else 0
 
-                amp = max_val - baseline_val
+                amp = max_val - baseline_average_max
                 is_success = (amp >= threshold)
 
                 file_amps.append(amp)
                 file_success.append(is_success)
-                file_baselines.append(baseline_val)
+                file_baselines.append(baseline_average_max)
                 file_maxs.append(max_val)
 
                 roi_events.append((amp, is_success))
+
+
 
             roi_traces_info[fname] = {
                 "traces": file_traces,
@@ -231,7 +237,7 @@ def run_analysis(
                 "success": file_success,
                 "baselines": file_baselines,
                 "maxs": file_maxs,
-                "baseline_sd_val": mean_sd,
+                "baseline_sd_val": baseline_average_sd,
                 "threshold_val": threshold,
             }
 
@@ -432,10 +438,10 @@ def run_analysis(
                 ax.hlines(info["baselines"][i], t_start, t_base_end, color="black")
                 ax.hlines(info["maxs"][i], t_max_start, t_max_end, color="black")
 
-                mean_sd = info["baseline_sd_val"]
+                average_sd = info["baseline_sd_val"]
                 thresh = info["threshold_val"]
                 base = info["baselines"][i]
-                ax.hlines(mean_sd + base, t_start, t_base_end, color="black", linestyles="dashed")
+                ax.hlines(average_sd + base, t_start, t_base_end, color="black", linestyles="dashed")
                 ax.hlines(thresh + base, t_start, t_base_end, color="black", linestyles="dashed")
 
             ax.set_xlabel("time (ms)")
