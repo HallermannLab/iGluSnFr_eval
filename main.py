@@ -199,8 +199,8 @@ def run_analysis(
             #if not baseline_average_sd:
             #    continue
 
-            baseline_average_sd = np.mean(baseline_sds)
-            baseline_average_max = np.mean(baseline_maxs)
+            baseline_average_sd = np.median(baseline_sds)
+            baseline_average_max = np.median(baseline_maxs)
             threshold = 3 * baseline_average_sd
 
             file_traces = []
