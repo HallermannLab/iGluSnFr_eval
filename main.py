@@ -43,6 +43,7 @@ def run_analysis(
     NOTE: This is your existing analysis, with the requested additions:
       - Add mito row (mito + zoom) under the diff row in each ROI PDF, both with ROI outline
       - Compute mean mito intensity per ROI and return it for Excel export
+
     """
     #print(f"    Running analysis for block: {block_name}")
 
