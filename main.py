@@ -5,6 +5,7 @@ except ImportError:
         "\nERROR: 'config.py' not found.\n"
         "Please create a local 'config.py' by copying 'config_template.py' and "
         "adjusting the paths for your system.\n"
+
     )
     raise SystemExit(1)
 import os
