@@ -218,3 +218,73 @@ Dependencies are listed in `requirements.txt`. The project expects a Python envi
 - numpy, pandas, scipy, matplotlib
 - scikit-image (`skimage`)
 - read-roi (for ImageJ ROI zip parsing)
+
+
+
+## 7) Branch: `compression_videos`
+
+The `compression_videos` branch adds an **optional preprocessing utility** to create compressed mirrors of your raw `EXTERNAL_DATA_FOLDER`.
+
+### 7.1 Why this branch exists
+Raw multi-page TIFF stacks are:
+- large on disk,
+- slow to copy/sync (especially to network/cloud storage),
+- and not ideal for quick “preview” playback.
+
+This branch provides a reproducible way to generate **two alternative representations** of the same dataset:
+1. **Lossless/analysis-friendly** storage (`.zarr`) for TIFF stacks  
+2. **Viewing-friendly** H.264 (`.mp4`) versions for fast playback
+
+Non-video files (e.g., ROI zips, metadata, mito images, etc.) are copied unchanged into both mirrors.
+
+### 7.2 What gets compressed (and what doesn’t)
+A small list of known “video stacks” is treated specially (by filename, e.g. `ap1+train.tif`, `ap2.tif`, … and `ind.tif`):
+
+- These TIFF stacks are **NOT copied as `.tif`** into the mirrors.
+- They are read from the source folder and written as:
+  - **`*.zarr`** into the “lossless” mirror
+  - **`*.mp4`** into the “for viewing” mirror
+
+Everything else is copied as-is to preserve folder structure.
+
+### 7.3 Outputs (folder mirrors)
+Given:
+
+- `EXTERNAL_DATA_FOLDER = /path/to/raw`
+
+The branch generates:
+
+- `/path/to/raw_compress_loss_less/`  
+  - contains non-video files copied
+  - contains video stacks as `*.zarr`
+
+- `/path/to/raw_compress_for_viewing/`  
+  - contains non-video files copied
+  - contains video stacks as `*.mp4`
+
+Folder structure under each mirror matches the source.
+
+### 7.4 How to run the compression utility
+This branch provides a function intended to be run as a script entry point:
+
+- `python main.py`
+
+It will:
+1. copy non-video files to both mirrors
+2. create `.zarr` for each TIFF stack in the “lossless” mirror
+3. create H.264 `.mp4` for each TIFF stack in the “for viewing” mirror
+
+> Tip: Make sure `config.EXTERNAL_DATA_FOLDER` points at the **raw** dataset root you want to mirror.
+
+### 7.5 Requirements / prerequisites
+- **ffmpeg** must be available on your PATH for MP4 encoding  
+  - Verify from a terminal: `ffmpeg -version`
+- For the **lossless Zarr** path, additional Python packages are required:
+  - `zarr`
+  - `numcodecs`
+
+If you only want MP4 viewing copies, you can skip the Zarr-related packages (but the lossless step will not run without them).
+
+### 7.6 Notes on data fidelity
+- Typical TIFF camera stacks are 12-bit stored in 16-bit; for MP4, frames are converted to **8-bit grayscale** before encoding (much smaller and widely compatible).
+- Use the **Zarr mirror** for analysis workflows where you need lossless pixel values.
