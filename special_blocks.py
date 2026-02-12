@@ -10,11 +10,86 @@ from roi_utils import build_roi_masks, load_image_2d
 from plotting_roi_pdf import plot_roi_pdf
 from mito_intensity import mean_intensity_in_mask
 
+import shutil
+import subprocess
+
 
 SPECIAL_INDUCTION_TIF = "ind.tif"
 SPECIAL_INDUCTION_CSV = "ind.csv"
 
 VIDEO_TIFS = [SPECIAL_INDUCTION_TIF]
+
+
+def _video_exists(tif_path: str) -> bool:
+    if os.path.exists(tif_path):
+        return True
+    mp4_path = os.path.splitext(tif_path)[0] + ".mp4"
+    return os.path.exists(mp4_path)
+
+
+def _read_stack_prefer_tif_else_mp4(tif_path: str) -> np.ndarray:
+    if os.path.exists(tif_path):
+        stk = io.imread(tif_path)
+        if stk.ndim == 2:
+            stk = stk[None, ...]
+        return stk
+
+    mp4_path = os.path.splitext(tif_path)[0] + ".mp4"
+    if not os.path.exists(mp4_path):
+        raise FileNotFoundError(f"No video found: {tif_path} (also checked {mp4_path})")
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        raise RuntimeError("ffmpeg/ffprobe not found on PATH (required to decode MP4 for analysis).")
+
+    probe_cmd = [
+        ffprobe,
+        "-hide_banner",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "default=noprint_wrappers=1",
+        mp4_path,
+    ]
+    probe_out = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="replace")
+    info = {}
+    for line in probe_out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k.strip()] = v.strip()
+
+    w = int(info["width"])
+    h = int(info["height"])
+
+    dec_cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-v",
+        "error",
+        "-i",
+        mp4_path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray16le",
+        "-",
+    ]
+    raw = subprocess.check_output(dec_cmd, stderr=subprocess.STDOUT)
+
+    frame_bytes = w * h * 2
+    if len(raw) % frame_bytes != 0:
+        raise RuntimeError(
+            f"Decoded MP4 size not divisible by frame size: {mp4_path} "
+            f"({len(raw)} bytes, {frame_bytes} bytes/frame)"
+        )
+
+    n_frames = len(raw) // frame_bytes
+    return np.frombuffer(raw, dtype=np.uint16).reshape((n_frames, h, w))
 
 
 def extract_roi_csvs(block_path, output_folder_csvs):
@@ -30,15 +105,12 @@ def extract_roi_csvs(block_path, output_folder_csvs):
     image_shape_hw = None
     for tif in VIDEO_TIFS:
         p = os.path.join(block_path, tif)
-        if os.path.exists(p):
-            stk = io.imread(p)
-            if stk.ndim == 3:
-                image_shape_hw = (stk.shape[1], stk.shape[2])
-            elif stk.ndim == 2:
-                image_shape_hw = stk.shape
+        if _video_exists(p):
+            stk = _read_stack_prefer_tif_else_mp4(p)
+            image_shape_hw = (stk.shape[1], stk.shape[2]) if stk.ndim == 3 else stk.shape
             break
     if image_shape_hw is None:
-        raise FileNotFoundError(f"Could not determine image shape (missing {SPECIAL_INDUCTION_TIF}).")
+        raise FileNotFoundError(f"Could not determine image shape (missing {SPECIAL_INDUCTION_TIF} or ind.mp4).")
 
     roi_masks = build_roi_masks(rois_data, image_shape_hw)
     if not roi_masks:
@@ -47,10 +119,10 @@ def extract_roi_csvs(block_path, output_folder_csvs):
     dict_csv_dfs = {}
     for tif in VIDEO_TIFS:
         p = os.path.join(block_path, tif)
-        if not os.path.exists(p):
+        if not _video_exists(p):
             continue
 
-        stk = io.imread(p)
+        stk = _read_stack_prefer_tif_else_mp4(p)
         if stk.ndim == 2:
             stk = stk[None, ...]
         if stk.ndim != 3:
@@ -105,8 +177,8 @@ def process_special_block(
     os.makedirs(output_csvs, exist_ok=True)
 
     ind_path = os.path.join(block_path, SPECIAL_INDUCTION_TIF)
-    if not os.path.exists(ind_path):
-        print(f"    Warning: {ind_path} not found. Skipping special block.")
+    if not _video_exists(ind_path):
+        print(f"    Warning: {ind_path} (or ind.mp4) not found. Skipping special block.")
         return {"mito_rows": []}
 
     # Always compute diff image (does not require ROIs.zip)

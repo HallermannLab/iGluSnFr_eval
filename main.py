@@ -27,9 +27,89 @@ from diff_image import calculate_diff_image
 from averages_report import save_block_averages_pdf
 from special_blocks import process_special_block
 
+import shutil
+import subprocess
+
 
 VIDEO_FILES = ["ap1+train.tif", "ap2.tif", "ap3.tif", "ap4.tif", "ap5.tif"]
 
+
+def _video_exists(tif_path: str) -> bool:
+    if os.path.exists(tif_path):
+        return True
+    mp4_path = os.path.splitext(tif_path)[0] + ".mp4"
+    return os.path.exists(mp4_path)
+
+
+def _read_stack_prefer_tif_else_mp4(tif_path: str) -> np.ndarray:
+    """
+    Returns stack shaped (frames, H, W) as uint16.
+
+    - If tif exists: read via skimage.io.imread
+    - Else if mp4 exists: decode via ffmpeg to gray16le
+    """
+    if os.path.exists(tif_path):
+        stk = io.imread(tif_path)
+        if stk.ndim == 2:
+            stk = stk[None, ...]
+        return stk
+
+    mp4_path = os.path.splitext(tif_path)[0] + ".mp4"
+    if not os.path.exists(mp4_path):
+        raise FileNotFoundError(f"No video found: {tif_path} (also checked {mp4_path})")
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        raise RuntimeError("ffmpeg/ffprobe not found on PATH (required to decode MP4 for analysis).")
+
+    probe_cmd = [
+        ffprobe,
+        "-hide_banner",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "default=noprint_wrappers=1",
+        mp4_path,
+    ]
+    probe_out = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="replace")
+    info = {}
+    for line in probe_out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k.strip()] = v.strip()
+
+    w = int(info["width"])
+    h = int(info["height"])
+
+    dec_cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-v",
+        "error",
+        "-i",
+        mp4_path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray16le",
+        "-",
+    ]
+    raw = subprocess.check_output(dec_cmd, stderr=subprocess.STDOUT)
+
+    frame_bytes = w * h * 2
+    if len(raw) % frame_bytes != 0:
+        raise RuntimeError(
+            f"Decoded MP4 size not divisible by frame size: {mp4_path} "
+            f"({len(raw)} bytes, {frame_bytes} bytes/frame)"
+        )
+
+    n_frames = len(raw) // frame_bytes
+    return np.frombuffer(raw, dtype=np.uint16).reshape((n_frames, h, w))
 
 def run_analysis(
     block_path,
@@ -486,8 +566,8 @@ def process_block(block_path, output_folder_experiment, recording_params):
     # --- handle special blocks before checking ap1+train.tif ---
     if is_special:
         ind_path = os.path.join(block_path, "ind.tif")
-        if not os.path.exists(ind_path):
-            print(f"    Warning: {ind_path} not found. Skipping special block.")
+        if not _video_exists(ind_path):
+            print(f"    Warning: ind.tif/mp4 not found in {block_path}. Skipping special block.")
             return {"rel": [], "wma": [], "mito": []}
 
         out = process_special_block(
@@ -501,8 +581,8 @@ def process_block(block_path, output_folder_experiment, recording_params):
     ap1_path = os.path.join(block_path, "ap1+train.tif")
     diff_image_path_and_name = os.path.join(output_folder_DiffImage, f"{block_name}_diff.tif")
 
-    if not os.path.exists(ap1_path):
-        print(f"    Warning: {ap1_path} not found. Skipping block.")
+    if not _video_exists(ap1_path):
+        print(f"    Warning: ap1+train.tif/mp4 not found in {block_path}. Skipping block.")
         return {"rel": [], "wma": [], "mito": []}
 
     # Standard blocks: compute diff with standard params
@@ -525,15 +605,16 @@ def process_block(block_path, output_folder_experiment, recording_params):
         print(f"    Error reading ROIs.zip: {e}")
         return {"rel": [], "wma": [], "mito": []}
 
+
     image_shape_hw = None
     for vid_file in VIDEO_FILES:
         vid_path_probe = os.path.join(block_path, vid_file)
-        if os.path.exists(vid_path_probe):
-            probe_img = io.imread(vid_path_probe)
-            if probe_img.ndim == 3:
-                image_shape_hw = (probe_img.shape[1], probe_img.shape[2])
-            elif probe_img.ndim == 2:
-                image_shape_hw = probe_img.shape
+        if _video_exists(vid_path_probe):
+            probe_stack = _read_stack_prefer_tif_else_mp4(vid_path_probe)
+            if probe_stack.ndim == 3:
+                image_shape_hw = (probe_stack.shape[1], probe_stack.shape[2])
+            elif probe_stack.ndim == 2:
+                image_shape_hw = probe_stack.shape
             break
 
     if image_shape_hw is None:
@@ -547,10 +628,10 @@ def process_block(block_path, output_folder_experiment, recording_params):
 
     for vid_file in VIDEO_FILES:
         vid_path = os.path.join(block_path, vid_file)
-        if not os.path.exists(vid_path):
+        if not _video_exists(vid_path):
             continue
 
-        stack = io.imread(vid_path)
+        stack = _read_stack_prefer_tif_else_mp4(vid_path)
         if stack.ndim == 2:
             stack = stack[np.newaxis, ...]
         if stack.ndim != 3:
@@ -581,6 +662,7 @@ def process_block(block_path, output_folder_experiment, recording_params):
 
         generated_csvs.append(csv_name)
         dict_csv_dfs[csv_name] = df_out
+
 
     # Standard analysis + mito means
     rel_data, wma_data, mito_data = [], [], []
