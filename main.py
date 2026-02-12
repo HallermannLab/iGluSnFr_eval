@@ -203,7 +203,7 @@ def _compress_strong_12bit_hevc(
     mp4_path: Path,
     *,
     fps: float = 30.0,
-    crf: int = 22,
+    crf: int = 12,
     preset: str = "slow",
 ) -> None:
     """
@@ -318,7 +318,7 @@ def compress_external_data_only() -> None:
     dst_lossless_p = Path(dst_lossless)
     dst_view_p = Path(dst_view)
     dst_strong12_p = Path(dst_strong12)
-
+    """
     print("\nCompressing loss_less (Zarr + Zstd + Bitshuffle) from SRC into mirror...")
     for tif in _iter_video_files(src, video_set):
         rel = tif.relative_to(src_p)
@@ -334,6 +334,7 @@ def compress_external_data_only() -> None:
         out_mp4.parent.mkdir(parents=True, exist_ok=True)
         print(f"  {rel} -> {out_mp4.relative_to(dst_view_p)}")
         _compress_for_viewing_h264(tif, out_mp4)
+    """
 
     print("\nCompressing strong_12bit (HEVC Main12) from SRC into mirror...")
     for tif in _iter_video_files(src, video_set):
@@ -341,7 +342,7 @@ def compress_external_data_only() -> None:
         out_mp4 = (dst_strong12_p / rel).with_suffix(".mp4")
         out_mp4.parent.mkdir(parents=True, exist_ok=True)
         print(f"  {rel} -> {out_mp4.relative_to(dst_strong12_p)}")
-        _compress_strong_12bit_hevc(tif, out_mp4, fps=30.0, crf=22, preset="slow")
+        _compress_strong_12bit_hevc(tif, out_mp4, fps=30.0, crf=8, preset="slow")
 
     print("\nDone.")
     print(f"Loss_less mirror:   {dst_lossless}")
