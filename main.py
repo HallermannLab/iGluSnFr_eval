@@ -24,7 +24,7 @@ import git_save as myGit
 from roi_utils import load_image_2d, build_roi_masks
 from mito_intensity import mean_intensity_in_mask
 from diff_image import calculate_diff_image
-from averages_report import save_block_averages_pdf
+from averages_report import save_block_averages_pdf, save_special_block_averages
 from special_blocks import process_special_block
 
 import shutil
@@ -576,6 +576,22 @@ def process_block(block_path, output_folder_experiment, recording_params):
             recording_params=recording_params,
             output_folder_experiment=output_folder_experiment,
         )
+
+        # Averages PDF + Excel for special blocks
+        ind_csv_path = os.path.join(output_folder_CSVs, "ind.csv")
+        if os.path.exists(ind_csv_path):
+            try:
+                df_ind = pd.read_csv(ind_csv_path)
+                if not df_ind.empty:
+                    save_special_block_averages(
+                        output_folder_averages=output_folder_averages,
+                        block_name=block_name,
+                        recording_params=recording_params,
+                        df_ind=df_ind,
+                    )
+            except Exception as e:
+                print(f"    Warning: could not generate averages for {block_name}: {e}")
+
         return {"rel": [], "wma": [], "mito": out.get("mito_rows", [])}
 
     ap1_path = os.path.join(block_path, "ap1+train.tif")

@@ -158,18 +158,19 @@ If `ROIs.zip` exists, each ROI PDF includes:
 If `ROIs.zip` is missing:
 - ROI CSV extraction and ROI PDFs are skipped for that block.
 
-### 3.4 `averages/` (block-level averages PDFs; standard blocks only)
-For each one-letter block:
+### 3.4 `averages/` (block-level averages PDFs and EXCEL)
 
-- `averages/<block>.pdf`
+- `averages/<block>.pdf` contains:
+     - Diff image (no zoom, no ROI overlay)
+     - Mito image (no zoom, no ROI overlay)
+     - Mean trace across all ROIs for `ap1+train.csv`
+     - Mean traces across all ROIs for `ap2.csv` … `ap5.csv`
 
-Contains:
-- Diff image (no zoom, no ROI overlay)
-- Mito image (no zoom, no ROI overlay)
-- Mean trace across all ROIs for `ap1+train.csv`
-- Mean traces across all ROIs for `ap2.csv` … `ap5.csv`
+- `averages/<block>_traces.xslx` contains:
+     - the average csv data and the average of all traces
 
-No release probability / amplitude analysis overlays are shown in these average plots.
+For special blocks a simplified version of the above is generated.
+  
 
 ### 3.5 `results/` (Excel summaries)
 Created per experiment:

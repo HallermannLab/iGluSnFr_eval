@@ -1,11 +1,44 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from roi_utils import load_image_2d
 
 
 VIDEO_CSV_FILES = ["ap1+train.csv", "ap2.csv", "ap3.csv", "ap4.csv", "ap5.csv"]
+
+
+def save_special_block_averages(
+    *,
+    output_folder_averages,
+    block_name,
+    recording_params,
+    df_ind,
+):
+    """Save average-of-ROIs PDF and Excel for special blocks (ind.csv)."""
+    os.makedirs(output_folder_averages, exist_ok=True)
+
+    acq_time = float(recording_params["acquisition time (ms)"])
+    y = _avg_trace(df_ind)
+    t = np.arange(len(y)) * acq_time
+
+    # PDF: single trace plot
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(t, y, color="black", linewidth=1)
+    ax.set_xlabel("time (ms)")
+    ax.set_ylabel("mean ROI intensity")
+    ax.set_title(f"Block averages: {block_name}")
+    fig.tight_layout()
+    pdf_path = os.path.join(output_folder_averages, f"{block_name}.pdf")
+    fig.savefig(pdf_path)
+    plt.close(fig)
+
+    # Excel: time and average
+    df_out = pd.DataFrame({"time_ms": t, "average": y})
+    xlsx_path = os.path.join(output_folder_averages, f"{block_name}_average.xlsx")
+    df_out.to_excel(xlsx_path, index=False)
+
 
 
 def _avg_trace(df):
@@ -78,4 +111,25 @@ def save_block_averages_pdf(
     out_path = os.path.join(output_folder_averages, f"{block_name}.pdf")
     fig.savefig(out_path)
     plt.close(fig)
+
+    # --- Excel export: all traces + grand average (one column per file, plus average) ---
+    all_traces = {}
+    ref_len = None
+    for fname in VIDEO_CSV_FILES:
+        if fname in dict_data_signal and not dict_data_signal[fname].empty:
+            y = _avg_trace(dict_data_signal[fname])
+            col_name = fname.replace(".csv", "")
+            all_traces[col_name] = y
+            if ref_len is None:
+                ref_len = len(y)
+
+    if all_traces and ref_len is not None:
+        t_all = np.arange(ref_len) * acq_time
+        df_all = pd.DataFrame({"time_ms": t_all})
+        for col_name, y in all_traces.items():
+            df_all[col_name] = y
+        df_all["average"] = np.mean(np.stack(list(all_traces.values())), axis=0)
+        xlsx_all_path = os.path.join(output_folder_averages, f"{block_name}_traces.xlsx")
+        df_all.to_excel(xlsx_all_path, index=False)
+
     return out_path
