@@ -108,6 +108,108 @@ def _iqr(values) -> float:
     q25, q75 = np.percentile(values, [25, 75])
     return float(q75 - q25)
 
+
+def _median_clean_blocks(clean_df: pd.DataFrame, block_names: list[str]) -> dict[str, float]:
+    """
+    Return median values for the requested block columns from one cleaned result table.
+    """
+    medians = {}
+
+    for block_name in block_names:
+        if block_name not in clean_df.columns:
+            medians[block_name] = np.nan
+            continue
+
+        values = pd.to_numeric(clean_df[block_name], errors="coerce")
+        medians[block_name] = float(values.median()) if values.notna().any() else np.nan
+
+    return medians
+
+
+def _save_summary_boxplots_pdf(summary_rows: list[dict], output_folder: str):
+    """
+    Save root-level summary PDF with paired experiment medians for blocks A, B and C.
+
+    Each row in summary_rows corresponds to one metadata row / experiment.
+    """
+    summary_folder = os.path.join(output_folder, "summary")
+    os.makedirs(summary_folder, exist_ok=True)
+
+    if not summary_rows:
+        print("No summary data available; summary PDF was not created.")
+        return
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_excel(os.path.join(summary_folder, "summary_medians.xlsx"), index=False)
+
+    block_names = ["A", "B", "C"]
+    metrics = [
+        ("release_probability", "release probability"),
+        ("amplitude", "amplitude"),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), constrained_layout=True)
+
+    for ax, (metric_key, metric_label) in zip(axes, metrics):
+        columns = [f"{metric_key}_{block_name}" for block_name in block_names]
+        data = [
+            pd.to_numeric(summary_df[column], errors="coerce").dropna().to_numpy()
+            for column in columns
+        ]
+
+        ax.boxplot(
+            data,
+            positions=np.arange(1, len(block_names) + 1),
+            widths=0.45,
+            showfliers=False,
+            patch_artist=True,
+            boxprops={"facecolor": "white", "edgecolor": "black"},
+            medianprops={"color": "black", "linewidth": 1.5},
+            whiskerprops={"color": "black"},
+            capprops={"color": "black"},
+        )
+
+        for _, row in summary_df.iterrows():
+            y_values = [
+                pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+                for column in columns
+            ]
+
+            if all(pd.isna(y) for y in y_values):
+                continue
+
+            ax.plot(
+                np.arange(1, len(block_names) + 1),
+                y_values,
+                color="0.55",
+                linewidth=0.8,
+                alpha=0.8,
+                zorder=2,
+            )
+            ax.scatter(
+                np.arange(1, len(block_names) + 1),
+                y_values,
+                color="black",
+                s=18,
+                alpha=0.85,
+                zorder=3,
+            )
+
+        ax.set_title(metric_label)
+        ax.set_xticks(np.arange(1, len(block_names) + 1))
+        ax.set_xticklabels(block_names)
+        ax.set_xlabel("block")
+        ax.set_ylabel("median value")
+        ax.grid(axis="y", alpha=0.25)
+
+    fig.suptitle("Median cleaned results across experiments")
+    pdf_path = os.path.join(summary_folder, "summary_boxplots.pdf")
+    fig.savefig(pdf_path, format="pdf")
+    plt.close(fig)
+
+    print(f"Saved summary PDF: {pdf_path}")
+
+
 def _calculate_train_qc_for_block(dict_csv_dfs, block_name, recording_params):
     """
     Calculate Train_Bsl_median, Train_Bsl_IRQ, Train_Peak, Train_fold per ROI
@@ -1070,6 +1172,8 @@ def iGluSnFr_eval():
     script_path = __file__ if "__file__" in globals() else None
     myGit.save_git_info(output_folder_used_data_and_code, script_path)
 
+    summary_rows = []
+
     for experiment_count, row in metadata_df.iterrows():
         experimentName = row["experimentName"]
         print(f"Processing experiment {experiment_count + 1}: {experimentName}")
@@ -1177,6 +1281,13 @@ def iGluSnFr_eval():
                 index=False,
             )
 
+            summary_row = {
+                "experimentName": experimentName,
+            }
+            rel_medians = _median_clean_blocks(rel_clean, ["A", "B", "C"])
+            for block_name, median_value in rel_medians.items():
+                summary_row[f"release_probability_{block_name}"] = median_value
+
             if not wma_with_qc.empty:
                 wma_clean = _filter_clean_result_df(
                     wma_with_qc,
@@ -1189,6 +1300,15 @@ def iGluSnFr_eval():
                     index=False,
                 )
 
+                wma_medians = _median_clean_blocks(wma_clean, ["A", "B", "C"])
+                for block_name, median_value in wma_medians.items():
+                    summary_row[f"amplitude_{block_name}"] = median_value
+            else:
+                for block_name in ["A", "B", "C"]:
+                    summary_row[f"amplitude_{block_name}"] = np.nan
+
+            summary_rows.append(summary_row)
+
             if not mito_with_qc.empty:
                 mito_clean = _filter_clean_result_df(
                     mito_with_qc,
@@ -1200,6 +1320,8 @@ def iGluSnFr_eval():
                     os.path.join(output_folder_results_clean, "mito_intensity.xlsx"),
                     index=False,
                 )
+
+    _save_summary_boxplots_pdf(summary_rows, output_folder)
 
     elapsed_seconds = time.perf_counter() - run_start_time
     elapsed_minutes = elapsed_seconds / 60
