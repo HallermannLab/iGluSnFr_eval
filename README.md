@@ -7,6 +7,7 @@ This project processes iGluSnFR imaging experiments organized in *experiment fol
 - **Per-ROI PDF reports** (images + traces)
 - **Per-block “averages” PDF reports** (one-letter blocks only)
 - **Excel summaries** (release probability, weighted amplitude, mito intensity)
+- **Final runtime report** printed to the terminal
 
 The workflow is driven by a **metadata Excel file** (“metafile”). A template with the required column names and typical values is included as:
 
@@ -41,7 +42,27 @@ The required column names and meanings are documented by example in:
 - acquisition timing parameters,
 - difference-image window parameters (baseline/stimulus windows),
 - plotting parameters (zoom size, optional plot limits),
-- and analysis parameters (filter cutoff, baseline/max windows, stimulation timing).
+- analysis parameters (filter cutoff, baseline/max windows, stimulation timing),
+- and whether ROI CSV files should be recalculated or loaded from cache.
+
+
+#### CSV caching parameter
+
+The metadata file can contain:
+
+- `Recalc_CSV`
+
+Use:
+
+- `Recalc_CSV = 1` to recalculate ROI CSV files from the video files.
+- `Recalc_CSV = 0` to reuse existing CSV files from the corresponding block folder in `EXTERNAL_DATA_FOLDER`, if available.
+
+Cached CSVs are stored inside each external data block folder:
+
+- Standard blocks: `EXTERNAL_DATA_FOLDER/<experiment>/<block>/CSVs/ap1+train.csv`, `ap2.csv`, …
+- Special blocks: `EXTERNAL_DATA_FOLDER/<experiment>/<block>/CSVs/ind.csv`
+
+If `Recalc_CSV = 0` but no cached CSVs are found, the program recalculates them from the videos and saves them to both the timestamped output folder and the corresponding external data block folder.
 
 #### Difference-image parameters
 The program computes a 2D difference image per block as:
@@ -100,13 +121,17 @@ For each experiment (row in the metadata Excel), the program:
    - standard blocks: from `ap1+train.tif` using `Diff_*`
    - special blocks: from `ind.tif` using `Diff_*_Induction`
 3. If `ROIs.zip` exists:
-   - extracts ROI mean intensity over time and writes CSV files
+   - loads existing ROI CSVs from the external block folder if `Recalc_CSV = 0` and cached CSVs exist
+   - otherwise extracts ROI mean intensity over time from the videos and writes CSV files
    - generates PDF reports
-4. For standard blocks only:
-   - runs the existing event-based analysis to compute:
+4. For standard blocks:
+   - runs the event-based analysis to compute:
      - release probability
      - weighted mean amplitude
-   - generates an “averages” PDF (mean across ROIs)
+   - generates an “averages” PDF
+5. For special blocks:
+   - generates a simplified average trace report from `ind.csv`
+6. At the end, prints the total runtime in seconds and minutes.
 
 ---
 
@@ -209,7 +234,10 @@ Notes:
 
 1. Create `config.py` from `config_template.py` and edit paths.
 2. Ensure your metadata Excel file exists and matches the columns shown in `metadata_example.xlsx`.
-3. Run:
+3. Set `Recalc_CSV` in the metadata file:
+   - `1` = recalculate CSVs from videos
+   - `0` = reuse cached CSVs if available
+4. Run:
 
 ---
 

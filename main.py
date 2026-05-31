@@ -9,6 +9,7 @@ except ImportError:
     raise SystemExit(1)
 
 import os
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -32,6 +33,58 @@ import subprocess
 
 
 VIDEO_FILES = ["ap1+train.tif", "ap2.tif", "ap3.tif", "ap4.tif", "ap5.tif"]
+VIDEO_CSV_FILES = [v.replace(".tif", ".csv") for v in VIDEO_FILES]
+
+
+def _metadata_flag_is_true(recording_params, key: str, default: int = 1) -> bool:
+    """
+    Read metadata flags such as Recalc_CSV robustly from Excel.
+
+    Treats 1, "1", "true", "yes", "y" as True.
+    Treats 0, "0", "false", "no", "n" as False.
+    """
+    value = recording_params.get(key, default)
+
+    if pd.isna(value):
+        value = default
+
+    if isinstance(value, str):
+        value = value.strip().lower()
+        return value in {"1", "true", "yes", "y"}
+
+    return bool(int(value))
+
+
+def _load_existing_csvs(csv_folder: str, expected_csv_files: list[str]) -> dict[str, pd.DataFrame]:
+    """
+    Load existing CSV files from csv_folder.
+
+    Returns an empty dict if none of the expected CSVs exist.
+    """
+    dict_csv_dfs = {}
+
+    for csv_name in expected_csv_files:
+        csv_path = os.path.join(csv_folder, csv_name)
+        if not os.path.exists(csv_path):
+            continue
+
+        try:
+            df = pd.read_csv(csv_path)
+            if not df.empty:
+                dict_csv_dfs[csv_name] = df
+        except Exception as e:
+            print(f"    Warning: could not read cached CSV {csv_path}: {e}")
+
+    return dict_csv_dfs
+
+
+def _save_csv_cache_copy(df: pd.DataFrame, csv_name: str, *folders: str):
+    """
+    Save one CSV DataFrame to multiple folders.
+    """
+    for folder in folders:
+        os.makedirs(folder, exist_ok=True)
+        df.to_csv(os.path.join(folder, csv_name), index=False)
 
 
 def _video_exists(tif_path: str) -> bool:
@@ -558,8 +611,13 @@ def process_block(block_path, output_folder_experiment, recording_params):
     output_folder_CSVs = os.path.join(output_folder_experiment, "CSVs", block_name)
     os.makedirs(output_folder_CSVs, exist_ok=True)
 
+    external_folder_CSVs = os.path.join(block_path, "CSVs")
+    os.makedirs(external_folder_CSVs, exist_ok=True)
+
     output_folder_averages = os.path.join(output_folder_experiment, "averages")
     os.makedirs(output_folder_averages, exist_ok=True)
+
+    recalc_csv = _metadata_flag_is_true(recording_params, "Recalc_CSV", default=1)
 
     print(f"  Processing block: {block_name}")
 
@@ -575,8 +633,8 @@ def process_block(block_path, output_folder_experiment, recording_params):
             block_name=block_name,
             recording_params=recording_params,
             output_folder_experiment=output_folder_experiment,
+            recalc_csv=recalc_csv,
         )
-
         # Averages PDF + Excel for special blocks
         ind_csv_path = os.path.join(output_folder_CSVs, "ind.csv")
         if os.path.exists(ind_csv_path):
@@ -607,78 +665,101 @@ def process_block(block_path, output_folder_experiment, recording_params):
     generated_csvs = []
     dict_csv_dfs = {}
 
-    rois_zip_path = os.path.join(block_path, "ROIs.zip")
-    if not os.path.exists(rois_zip_path):
-        print(f"    Warning: ROIs.zip not found at {rois_zip_path}. Skipping intensity extraction.")
-        return {"rel": [], "wma": [], "mito": []}
+    expected_existing_csvs = [
+        vid_file.replace(".tif", ".csv")
+        for vid_file in VIDEO_FILES
+        if _video_exists(os.path.join(block_path, vid_file))
+    ]
 
-    try:
-        rois_data = read_roi_zip(rois_zip_path)
-        if not rois_data:
-            print("    Warning: No ROIs found in ROIs.zip. Skipping intensity extraction.")
+    if not recalc_csv:
+        dict_csv_dfs = _load_existing_csvs(external_folder_CSVs, expected_existing_csvs)
+
+        if dict_csv_dfs:
+            print(f"    Using cached CSV files from {external_folder_CSVs}")
+
+            for csv_name, df_cached in dict_csv_dfs.items():
+                _save_csv_cache_copy(df_cached, csv_name, output_folder_CSVs)
+
+            generated_csvs = list(dict_csv_dfs.keys())
+        else:
+            print(f"    No cached CSV files found in {external_folder_CSVs}. Recalculating from videos.")
+
+    if recalc_csv or not dict_csv_dfs:
+        rois_zip_path = os.path.join(block_path, "ROIs.zip")
+        if not os.path.exists(rois_zip_path):
+            print(f"    Warning: ROIs.zip not found at {rois_zip_path}. Skipping intensity extraction.")
             return {"rel": [], "wma": [], "mito": []}
-    except Exception as e:
-        print(f"    Error reading ROIs.zip: {e}")
-        return {"rel": [], "wma": [], "mito": []}
 
+        try:
+            rois_data = read_roi_zip(rois_zip_path)
+            if not rois_data:
+                print("    Warning: No ROIs found in ROIs.zip. Skipping intensity extraction.")
+                return {"rel": [], "wma": [], "mito": []}
+        except Exception as e:
+            print(f"    Error reading ROIs.zip: {e}")
+            return {"rel": [], "wma": [], "mito": []}
 
-    image_shape_hw = None
-    for vid_file in VIDEO_FILES:
-        vid_path_probe = os.path.join(block_path, vid_file)
-        if _video_exists(vid_path_probe):
-            probe_stack = _read_stack_prefer_tif_else_mp4(vid_path_probe)
-            if probe_stack.ndim == 3:
-                image_shape_hw = (probe_stack.shape[1], probe_stack.shape[2])
-            elif probe_stack.ndim == 2:
-                image_shape_hw = probe_stack.shape
-            break
+        image_shape_hw = None
+        for vid_file in VIDEO_FILES:
+            vid_path_probe = os.path.join(block_path, vid_file)
+            if _video_exists(vid_path_probe):
+                probe_stack = _read_stack_prefer_tif_else_mp4(vid_path_probe)
+                if probe_stack.ndim == 3:
+                    image_shape_hw = (probe_stack.shape[1], probe_stack.shape[2])
+                elif probe_stack.ndim == 2:
+                    image_shape_hw = probe_stack.shape
+                break
 
-    if image_shape_hw is None:
-        print("    Warning: Could not determine image shape (no videos found). Skipping intensity extraction.")
-        return {"rel": [], "wma": [], "mito": []}
+        if image_shape_hw is None:
+            print("    Warning: Could not determine image shape (no videos found). Skipping intensity extraction.")
+            return {"rel": [], "wma": [], "mito": []}
 
-    roi_masks = build_roi_masks(rois_data, image_shape_hw)
-    if not roi_masks:
-        print("    Warning: No valid ROI masks produced. Skipping intensity extraction.")
-        return {"rel": [], "wma": [], "mito": []}
+        roi_masks = build_roi_masks(rois_data, image_shape_hw)
+        if not roi_masks:
+            print("    Warning: No valid ROI masks produced. Skipping intensity extraction.")
+            return {"rel": [], "wma": [], "mito": []}
 
-    for vid_file in VIDEO_FILES:
-        vid_path = os.path.join(block_path, vid_file)
-        if not _video_exists(vid_path):
-            continue
-
-        stack = _read_stack_prefer_tif_else_mp4(vid_path)
-        if stack.ndim == 2:
-            stack = stack[np.newaxis, ...]
-        if stack.ndim != 3:
-            continue
-
-        data_cols = {}
-        for roi_name, mask in roi_masks.items():
-            if mask.shape != stack.shape[1:]:
-                hh = min(stack.shape[1], mask.shape[0])
-                ww = min(stack.shape[2], mask.shape[1])
-                sub_mask = mask[:hh, :ww]
-                sub_stack = stack[:, :hh, :ww]
-            else:
-                sub_mask = mask
-                sub_stack = stack
-
-            if not sub_mask.any():
+        for vid_file in VIDEO_FILES:
+            vid_path = os.path.join(block_path, vid_file)
+            if not _video_exists(vid_path):
                 continue
-            data_cols[roi_name] = sub_stack[:, sub_mask].mean(axis=1)
 
-        if not data_cols:
-            continue
+            stack = _read_stack_prefer_tif_else_mp4(vid_path)
+            if stack.ndim == 2:
+                stack = stack[np.newaxis, ...]
+            if stack.ndim != 3:
+                continue
 
-        df_out = pd.DataFrame(data_cols)
-        csv_name = vid_file.replace(".tif", ".csv")
-        csv_output_path = os.path.join(output_folder_CSVs, csv_name)
-        df_out.to_csv(csv_output_path, index=False)
+            data_cols = {}
+            for roi_name, mask in roi_masks.items():
+                if mask.shape != stack.shape[1:]:
+                    hh = min(stack.shape[1], mask.shape[0])
+                    ww = min(stack.shape[2], mask.shape[1])
+                    sub_mask = mask[:hh, :ww]
+                    sub_stack = stack[:, :hh, :ww]
+                else:
+                    sub_mask = mask
+                    sub_stack = stack
 
-        generated_csvs.append(csv_name)
-        dict_csv_dfs[csv_name] = df_out
+                if not sub_mask.any():
+                    continue
+                data_cols[roi_name] = sub_stack[:, sub_mask].mean(axis=1)
 
+            if not data_cols:
+                continue
+
+            df_out = pd.DataFrame(data_cols)
+            csv_name = vid_file.replace(".tif", ".csv")
+
+            _save_csv_cache_copy(
+                df_out,
+                csv_name,
+                output_folder_CSVs,
+                external_folder_CSVs,
+            )
+
+            generated_csvs.append(csv_name)
+            dict_csv_dfs[csv_name] = df_out
 
     # Standard analysis + mito means
     rel_data, wma_data, mito_data = [], [], []
@@ -708,6 +789,8 @@ def process_block(block_path, output_folder_experiment, recording_params):
 
 
 def iGluSnFr_eval():
+    run_start_time = time.perf_counter()
+
     timestamp = datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     output_folder = os.path.join(config.ROOT_FOLDER, f"output_{config.MY_INITIAL}_{timestamp}")
     os.makedirs(output_folder, exist_ok=True)
@@ -786,6 +869,11 @@ def iGluSnFr_eval():
                 index=False,
             )
 
+    elapsed_seconds = time.perf_counter() - run_start_time
+    elapsed_minutes = elapsed_seconds / 60
 
+    print("\nAnalysis completed.")
+    print(f"Total runtime: {elapsed_seconds:.1f} seconds ({elapsed_minutes:.2f} minutes)")
+    
 if __name__ == "__main__":
     iGluSnFr_eval()

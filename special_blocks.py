@@ -13,12 +13,40 @@ from mito_intensity import mean_intensity_in_mask
 import shutil
 import subprocess
 
-
 SPECIAL_INDUCTION_TIF = "ind.tif"
 SPECIAL_INDUCTION_CSV = "ind.csv"
 
 VIDEO_TIFS = [SPECIAL_INDUCTION_TIF]
 
+
+def _load_existing_csvs(csv_folder: str, expected_csv_files: list[str]) -> dict[str, pd.DataFrame]:
+    """
+    Load existing CSV files from csv_folder.
+
+    Returns an empty dict if none of the expected CSVs exist.
+    """
+    dict_csv_dfs = {}
+
+    for csv_name in expected_csv_files:
+        csv_path = os.path.join(csv_folder, csv_name)
+        if not os.path.exists(csv_path):
+            continue
+
+        try:
+            df = pd.read_csv(csv_path)
+            if not df.empty:
+                dict_csv_dfs[csv_name] = df
+        except Exception as e:
+            print(f"    Warning: could not read cached CSV {csv_path}: {e}")
+
+    return dict_csv_dfs
+
+
+def _copy_csvs_to_folder(dict_csv_dfs: dict[str, pd.DataFrame], output_folder: str):
+    os.makedirs(output_folder, exist_ok=True)
+
+    for csv_name, df in dict_csv_dfs.items():
+        df.to_csv(os.path.join(output_folder, csv_name), index=False)
 
 def _video_exists(tif_path: str) -> bool:
     if os.path.exists(tif_path):
@@ -92,7 +120,7 @@ def _read_stack_prefer_tif_else_mp4(tif_path: str) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.uint16).reshape((n_frames, h, w))
 
 
-def extract_roi_csvs(block_path, output_folder_csvs):
+def extract_roi_csvs(block_path, output_folder_csvs, external_folder_csvs=None):
     """
     Generate CSVs from ROIs for each video tif in VIDEO_TIFS.
     Returns dict csv_name -> DataFrame
@@ -149,10 +177,12 @@ def extract_roi_csvs(block_path, output_folder_csvs):
         df_out = pd.DataFrame(data_cols)
         csv_name = tif.replace(".tif", ".csv")  # ind.tif -> ind.csv
         df_out.to_csv(os.path.join(output_folder_csvs, csv_name), index=False)
+        if external_folder_csvs is not None:
+            df_out.to_csv(os.path.join(external_folder_csvs, csv_name), index=False)
+
         dict_csv_dfs[csv_name] = df_out
 
     return rois_data, roi_masks, dict_csv_dfs
-
 
 def process_special_block(
     *,
@@ -160,6 +190,7 @@ def process_special_block(
     block_name,
     recording_params,
     output_folder_experiment,
+    recalc_csv=True,
 ):
     """
     Special blocks (names length > 1), do ONLY:
@@ -171,10 +202,12 @@ def process_special_block(
     output_rois = os.path.join(output_folder_experiment, "ROIs")
     output_diff = os.path.join(output_folder_experiment, "DiffImage")
     output_csvs = os.path.join(output_folder_experiment, "CSVs", block_name)
+    external_csvs = os.path.join(block_path, "CSVs")
 
     os.makedirs(output_rois, exist_ok=True)
     os.makedirs(output_diff, exist_ok=True)
     os.makedirs(output_csvs, exist_ok=True)
+    os.makedirs(external_csvs, exist_ok=True)
 
     ind_path = os.path.join(block_path, SPECIAL_INDUCTION_TIF)
     if not _video_exists(ind_path):
@@ -195,23 +228,63 @@ def process_special_block(
         return {"mito_rows": []}
 
     mito_path = os.path.join(block_path, "mito.tif")
-    if not os.path.exists(mito_path):
-        print(f"    Info: {mito_path} not found. Skipping ROI PDFs and mito intensity for special block {block_name}.")
-        return {"mito_rows": []}
+    has_mito = os.path.exists(mito_path)
+    if not has_mito:
+        print(
+            f"    Info: {mito_path} not found. "
+            f"Will still generate/load CSVs, but skip ROI PDFs and mito intensity for special block {block_name}."
+        )
 
     # ROI-based work (CSVs + PDFs + mito means)
+    dict_csv_dfs = {}
+
+    if not recalc_csv:
+        dict_csv_dfs = _load_existing_csvs(external_csvs, [SPECIAL_INDUCTION_CSV])
+
+        if dict_csv_dfs:
+            print(f"    Using cached CSV files from {external_csvs}")
+            _copy_csvs_to_folder(dict_csv_dfs, output_csvs)
+        else:
+            print(f"    No cached CSV files found in {external_csvs}. Recalculating from videos.")
+
     try:
-        rois_data, roi_masks, dict_csv_dfs = extract_roi_csvs(block_path, output_csvs)
+        if recalc_csv or not dict_csv_dfs:
+            rois_data, roi_masks, dict_csv_dfs = extract_roi_csvs(
+                block_path,
+                output_csvs,
+                external_folder_csvs=external_csvs,
+            )
+        else:
+            rois_data = read_roi_zip(rois_zip_path)
+
+            ind_path_for_shape = os.path.join(block_path, SPECIAL_INDUCTION_TIF)
+            stk = _read_stack_prefer_tif_else_mp4(ind_path_for_shape)
+            image_shape_hw = (stk.shape[1], stk.shape[2]) if stk.ndim == 3 else stk.shape
+            roi_masks = build_roi_masks(rois_data, image_shape_hw)
+
     except Exception as e:
         print(f"    Warning: ROI extraction failed for special block {block_name}: {e}")
         return {"mito_rows": []}
 
-    try:
-        mito_img = load_image_2d(mito_path, mode="first")
-        diff_img = load_image_2d(diff_path, mode="first")
-    except Exception as e:
-        print(f"    Warning: Failed to load images for special block {block_name}: {e}")
-        return {"mito_rows": []}
+    mito_img = None
+    diff_img = None
+
+    if has_mito:
+        try:
+            mito_img = load_image_2d(mito_path, mode="first")
+            diff_img = load_image_2d(diff_path, mode="first")
+        except Exception as e:
+            print(f"    Warning: Failed to load images for special block {block_name}: {e}")
+            mito_img = None
+            diff_img = None
+            has_mito = False
+
+    acq_time = float(recording_params["acquisition time (ms)"])
+    zoom_size = float(recording_params.get("ZoomSize", 40))
+
+    mito_rows = []
+    if not has_mito:
+        return {"mito_rows": mito_rows}
 
     acq_time = float(recording_params["acquisition time (ms)"])
     zoom_size = float(recording_params.get("ZoomSize", 40))
