@@ -86,6 +86,210 @@ def _save_csv_cache_copy(df: pd.DataFrame, csv_name: str, *folders: str):
         os.makedirs(folder, exist_ok=True)
         df.to_csv(os.path.join(folder, csv_name), index=False)
 
+def _get_float_param(recording_params, key: str, default=np.nan) -> float:
+    value = recording_params.get(key, default)
+    if pd.isna(value):
+        return default
+    return float(value)
+
+
+def _get_int_param(recording_params, key: str, default=0) -> int:
+    value = recording_params.get(key, default)
+    if pd.isna(value):
+        return default
+    return int(value)
+
+
+def _iqr(values) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+    if values.size == 0:
+        return np.nan
+    q25, q75 = np.percentile(values, [25, 75])
+    return float(q75 - q25)
+
+def _calculate_train_qc_for_block(dict_csv_dfs, block_name, recording_params):
+    """
+    Calculate Train_Bsl_median, Train_Bsl_IRQ, Train_Peak, Train_fold per ROI
+    from ap1+train.csv for one block.
+
+    Uses metadata columns:
+      Train_Bsl_Start, Train_Bsl_End, Train_Peak_Start, Train_Peak_End
+    """
+    train_key = "ap1+train.csv"
+    if train_key not in dict_csv_dfs:
+        return {}
+
+    df_train = dict_csv_dfs[train_key]
+    if not isinstance(df_train, pd.DataFrame) or df_train.empty:
+        return {}
+
+    cols_to_drop = [c for c in df_train.columns if c in ["Average", "Err", " "]]
+    if cols_to_drop:
+        df_train = df_train.drop(cols_to_drop, axis=1)
+
+    if df_train.empty:
+        return {}
+
+    acq_time = float(recording_params["acquisition time (ms)"])
+
+    bsl_start = int(_get_float_param(recording_params, "Train_Bsl_Start") / acq_time)
+    bsl_end = int(_get_float_param(recording_params, "Train_Bsl_End") / acq_time)
+    peak_start = int(_get_float_param(recording_params, "Train_Peak_Start") / acq_time)
+    peak_end = int(_get_float_param(recording_params, "Train_Peak_End") / acq_time)
+
+    out = {}
+
+    for roi in df_train.columns:
+        y = df_train[roi].to_numpy(dtype=float)
+
+        bsl_values = y[bsl_start:bsl_end]
+        peak_values = y[peak_start:peak_end]
+
+        if bsl_values.size == 0 or peak_values.size == 0:
+            out[roi] = {
+                f"Train_Bsl_median_{block_name}": "",
+                f"Train_Bsl_IRQ_{block_name}": "",
+                f"Train_Peak_{block_name}": "",
+                f"Train_fold_{block_name}": "",
+            }
+            continue
+
+        bsl_median = float(np.median(bsl_values))
+        bsl_iqr = _iqr(bsl_values)
+        peak = float(np.max(peak_values))
+
+        if pd.isna(bsl_iqr) or bsl_iqr == 0:
+            train_fold = np.nan
+        else:
+            train_fold = (peak - bsl_median) / bsl_iqr
+
+        out[roi] = {
+            f"Train_Bsl_median_{block_name}": bsl_median,
+            f"Train_Bsl_IRQ_{block_name}": bsl_iqr,
+            f"Train_Peak_{block_name}": peak,
+            f"Train_fold_{block_name}": train_fold,
+        }
+
+    return out
+
+def _append_qc_columns(df, qc_by_roi):
+    """
+    Add train QC columns and excluded-stimulus counts to a result dataframe.
+
+    df must contain column ROI_number.
+
+    The columns are detected dynamically from qc_by_roi instead of being
+    hard-coded to blocks A/B/C. This prevents missing Excel values when
+    block folder names are lowercase or use names other than A, B, C.
+    """
+    if df.empty or "ROI_number" not in df.columns:
+        return df
+
+    df = df.copy()
+
+    qc_columns = []
+    for roi_qc in qc_by_roi.values():
+        for col in roi_qc.keys():
+            if col not in qc_columns:
+                qc_columns.append(col)
+
+    train_prefix_order = [
+        "Train_Bsl_median",
+        "Train_Bsl_IRQ",
+        "Train_Peak",
+        "Train_fold",
+        "Exclude_Stim_number",
+    ]
+
+    def _qc_column_sort_key(col):
+        for prefix_index, prefix in enumerate(train_prefix_order):
+            prefix_with_sep = f"{prefix}_"
+            if col.startswith(prefix_with_sep):
+                block_name = col[len(prefix_with_sep):]
+                return block_name, prefix_index, col
+        return col, len(train_prefix_order), col
+
+    qc_columns = sorted(qc_columns, key=_qc_column_sort_key)
+
+    for col in qc_columns:
+        df[col] = df["ROI_number"].map(
+            lambda roi: qc_by_roi.get(roi, {}).get(col, "")
+        )
+
+    return df
+
+def _roi_should_be_excluded_from_clean(roi, qc_by_roi, rel_prob_df, recording_params):
+    """
+    Decide whether one ROI should be removed from results_clean.
+    """
+    roi_qc = qc_by_roi.get(roi, {})
+
+    train_bc_threshold = _get_float_param(
+        recording_params,
+        "Exclude_ROI_when_trainBC<xx-fold",
+        default=np.nan,
+    )
+    pr_a_threshold = _get_float_param(
+        recording_params,
+        "Exclude_ROI_when_PrA>xx",
+        default=np.nan,
+    )
+    excluded_stim_threshold = _get_float_param(
+        recording_params,
+        "Exclude_ROI_when_#excludedStim>xx",
+        default=np.nan,
+    )
+
+    train_fold_b = roi_qc.get("Train_fold_B", np.nan)
+    train_fold_c = roi_qc.get("Train_fold_C", np.nan)
+
+    if not pd.isna(train_bc_threshold):
+        if not pd.isna(train_fold_b) and not pd.isna(train_fold_c):
+            if train_fold_b < train_bc_threshold and train_fold_c < train_bc_threshold:
+                return True
+
+    if not pd.isna(pr_a_threshold):
+        if "A" in rel_prob_df.columns and roi in rel_prob_df.index:
+            pr_a = rel_prob_df.loc[roi, "A"]
+            if not pd.isna(pr_a) and pr_a > pr_a_threshold:
+                return True
+
+    if not pd.isna(excluded_stim_threshold):
+        total_excluded = 0
+        found_any = False
+        for block in ["A", "B", "C"]:
+            value = roi_qc.get(f"Exclude_Stim_number_{block}", "")
+            if value != "" and not pd.isna(value):
+                total_excluded += int(value)
+                found_any = True
+
+        if found_any and total_excluded > excluded_stim_threshold:
+            return True
+
+    return False
+
+
+def _filter_clean_result_df(df_with_qc, rel_prob_df, qc_by_roi, recording_params):
+    """
+    Remove excluded ROIs from one result dataframe.
+    """
+    if df_with_qc.empty or "ROI_number" not in df_with_qc.columns:
+        return df_with_qc
+
+    keep_rows = []
+    for _, row in df_with_qc.iterrows():
+        roi = row["ROI_number"]
+        exclude = _roi_should_be_excluded_from_clean(
+            roi=roi,
+            qc_by_roi=qc_by_roi,
+            rel_prob_df=rel_prob_df,
+            recording_params=recording_params,
+        )
+        keep_rows.append(not exclude)
+
+    return df_with_qc.loc[keep_rows].copy()
+
 
 def _video_exists(tif_path: str) -> bool:
     if os.path.exists(tif_path):
@@ -181,6 +385,12 @@ def run_analysis(
 
     VIDEO_CSV_FILES = ["ap1+train.csv", "ap2.csv", "ap3.csv", "ap4.csv", "ap5.csv"]
 
+    exclude_stim_baseline_percent = _get_float_param(
+        recording_params,
+        "Exclude_stim_when_baseline>xx%_of_ min_bsl_per_trace",
+        default=np.nan,
+    )
+
     output_dir = output_folder_ROIs
     os.makedirs(output_dir, exist_ok=True)
 
@@ -213,7 +423,7 @@ def run_analysis(
     # 1. Load Data (in-memory)
     if not isinstance(dict_data_signal, dict) or not dict_data_signal:
         print("      No CSV data provided in-memory. Aborting analysis.")
-        return [], [], []
+        return [], [], [], []
 
     list_ROIs = None
     cleaned_signal = {}
@@ -230,7 +440,7 @@ def run_analysis(
     dict_data_signal = cleaned_signal
     if not dict_data_signal or not list_ROIs:
         print("      In-memory CSV dataframes are empty/invalid. Aborting analysis.")
-        return [], [], []
+        return [], [], [], []
 
     # 2. Parameters
     try:
@@ -250,7 +460,7 @@ def run_analysis(
         zoom_size = float(recording_params.get("ZoomSize", 40))
     except KeyError as e:
         print(f"      Missing recording parameter: {e}")
-        return [], [], []
+        return [], [], [], []
 
     def get_time_idx(ms):
         return int(ms / acq_time)
@@ -298,6 +508,7 @@ def run_analysis(
     # 5. Existing analysis outputs
     export_data_rel_prob = []
     export_data_w_mean_amp = []
+    export_data_excluded_stim = []
 
     idx_baseline_end = get_time_idx(baseline_dur)
     idx_max_start = get_time_idx(trace_start_offset)
@@ -310,6 +521,7 @@ def run_analysis(
 
         roi_events = []
         roi_traces_info = {}
+        roi_excluded_stim_count = 0
 
         for fname in VIDEO_CSV_FILES:
             if fname not in dict_data_filtered:
@@ -323,17 +535,44 @@ def run_analysis(
 
             baseline_sds = []
             baseline_maxs = []
-            
+
             for (start, _) in stim_indices:
                 baseline_seg = roi_sig[start: start + idx_baseline_end]
                 baseline_sds.append(np.std(baseline_seg))
                 baseline_maxs.append(np.max(baseline_seg))
 
-            #if not baseline_average_sd:
-            #    continue
+            min_bsl_per_trace = np.min(baseline_maxs) if baseline_maxs else np.nan
 
-            baseline_average_sd = np.median(baseline_sds)
-            baseline_average_max = np.median(baseline_maxs)
+            excluded_stim_for_trace = []
+            for baseline_max in baseline_maxs:
+                exclude_this_stim = False
+
+                if not pd.isna(exclude_stim_baseline_percent) and not pd.isna(min_bsl_per_trace):
+                    threshold_baseline = (
+                                                 1 + 0.01 * exclude_stim_baseline_percent
+                                         ) * min_bsl_per_trace
+                    exclude_this_stim = baseline_max > threshold_baseline
+
+                excluded_stim_for_trace.append(exclude_this_stim)
+
+            roi_excluded_stim_count += int(np.sum(excluded_stim_for_trace))
+
+            valid_baseline_sds = [
+                value
+                for value, excluded in zip(baseline_sds, excluded_stim_for_trace)
+                if not excluded
+            ]
+            valid_baseline_maxs = [
+                value
+                for value, excluded in zip(baseline_maxs, excluded_stim_for_trace)
+                if not excluded
+            ]
+
+            if not valid_baseline_sds or not valid_baseline_maxs:
+                continue
+
+            baseline_average_sd = np.median(valid_baseline_sds)
+            baseline_average_max = np.median(valid_baseline_maxs)
             threshold = 3 * baseline_average_sd
 
             file_traces = []
@@ -341,28 +580,27 @@ def run_analysis(
             file_success = []
             file_baselines = []
             file_maxs = []
+            file_excluded = []
 
-            for (start, end) in stim_indices:
+            for stim_i, (start, end) in enumerate(stim_indices):
                 trace_seg = roi_sig[start:end]
                 file_traces.append(trace_seg)
-
-                #b_seg = roi_sig[start: start + idx_baseline_end]
-                #baseline_val = np.max(b_seg) if len(b_seg) > 0 else 0
 
                 m_seg = roi_sig[start + idx_max_start: start + idx_max_end]
                 max_val = np.max(m_seg) if len(m_seg) > 0 else 0
 
                 amp = max_val - baseline_average_max
-                is_success = (amp >= threshold)
+                is_success = amp >= threshold
+                is_excluded = excluded_stim_for_trace[stim_i]
 
                 file_amps.append(amp)
                 file_success.append(is_success)
                 file_baselines.append(baseline_average_max)
                 file_maxs.append(max_val)
+                file_excluded.append(is_excluded)
 
-                roi_events.append((amp, is_success))
-
-
+                if not is_excluded:
+                    roi_events.append((amp, is_success))
 
             roi_traces_info[fname] = {
                 "traces": file_traces,
@@ -370,12 +608,14 @@ def run_analysis(
                 "success": file_success,
                 "baselines": file_baselines,
                 "maxs": file_maxs,
+                "excluded": file_excluded,
                 "baseline_sd_val": baseline_average_sd,
                 "threshold_val": threshold,
             }
 
         all_amps = [x[0] for x in roi_events]
         if not all_amps:
+            export_data_excluded_stim.append([roi, roi_excluded_stim_count])
             continue
 
         counts, bin_edges = np.histogram(all_amps, bins=20)
@@ -402,6 +642,7 @@ def run_analysis(
 
         export_data_rel_prob.append([roi, rel_prob])
         export_data_w_mean_amp.append([roi, w_mean_amp])
+        export_data_excluded_stim.append([roi, roi_excluded_stim_count])
 
         # ---- Plotting (add mito row) ----
         current_roi_data = rois_data.get(roi)
@@ -571,6 +812,15 @@ def run_analysis(
                 ax.hlines(info["baselines"][i], t_start, t_base_end, color="black")
                 ax.hlines(info["maxs"][i], t_max_start, t_max_end, color="black")
 
+                if info.get("excluded", [False] * len(info["traces"]))[i]:
+                    ax.axvspan(
+                        t_start,
+                        time_arr[-1],
+                        color="red",
+                        alpha=0.12,
+                        label="excluded stim" if i == 0 else None,
+                    )
+
                 average_sd = info["baseline_sd_val"]
                 thresh = info["threshold_val"]
                 base = info["baselines"][i]
@@ -591,8 +841,7 @@ def run_analysis(
         print(f"      {roi}")
 
     #print("    Analysis completed.")
-    return export_data_rel_prob, export_data_w_mean_amp, mito_means
-
+    return export_data_rel_prob, export_data_w_mean_amp, mito_means, export_data_excluded_stim
 
 def process_block(block_path, output_folder_experiment, recording_params):
     """
@@ -601,6 +850,9 @@ def process_block(block_path, output_folder_experiment, recording_params):
     """
     block_name = os.path.basename(block_path)
     is_special = len(str(block_name)) > 1
+
+    train_qc = {}
+    excluded_stim = []
 
     output_folder_ROIs = os.path.join(output_folder_experiment, "ROIs")
     os.makedirs(output_folder_ROIs, exist_ok=True)
@@ -626,7 +878,7 @@ def process_block(block_path, output_folder_experiment, recording_params):
         ind_path = os.path.join(block_path, "ind.tif")
         if not _video_exists(ind_path):
             print(f"    Warning: ind.tif/mp4 not found in {block_path}. Skipping special block.")
-            return {"rel": [], "wma": [], "mito": []}
+            return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
         out = process_special_block(
             block_path=block_path,
@@ -650,14 +902,14 @@ def process_block(block_path, output_folder_experiment, recording_params):
             except Exception as e:
                 print(f"    Warning: could not generate averages for {block_name}: {e}")
 
-        return {"rel": [], "wma": [], "mito": out.get("mito_rows", [])}
+        return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
     ap1_path = os.path.join(block_path, "ap1+train.tif")
     diff_image_path_and_name = os.path.join(output_folder_DiffImage, f"{block_name}_diff.tif")
 
     if not _video_exists(ap1_path):
         print(f"    Warning: ap1+train.tif/mp4 not found in {block_path}. Skipping block.")
-        return {"rel": [], "wma": [], "mito": []}
+        return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
     # Standard blocks: compute diff with standard params
     calculate_diff_image(ap1_path, diff_image_path_and_name, recording_params, param_suffix="")
@@ -688,16 +940,16 @@ def process_block(block_path, output_folder_experiment, recording_params):
         rois_zip_path = os.path.join(block_path, "ROIs.zip")
         if not os.path.exists(rois_zip_path):
             print(f"    Warning: ROIs.zip not found at {rois_zip_path}. Skipping intensity extraction.")
-            return {"rel": [], "wma": [], "mito": []}
+            return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
         try:
             rois_data = read_roi_zip(rois_zip_path)
             if not rois_data:
                 print("    Warning: No ROIs found in ROIs.zip. Skipping intensity extraction.")
-                return {"rel": [], "wma": [], "mito": []}
+                return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
         except Exception as e:
             print(f"    Error reading ROIs.zip: {e}")
-            return {"rel": [], "wma": [], "mito": []}
+            return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
         image_shape_hw = None
         for vid_file in VIDEO_FILES:
@@ -712,12 +964,12 @@ def process_block(block_path, output_folder_experiment, recording_params):
 
         if image_shape_hw is None:
             print("    Warning: Could not determine image shape (no videos found). Skipping intensity extraction.")
-            return {"rel": [], "wma": [], "mito": []}
+            return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
         roi_masks = build_roi_masks(rois_data, image_shape_hw)
         if not roi_masks:
             print("    Warning: No valid ROI masks produced. Skipping intensity extraction.")
-            return {"rel": [], "wma": [], "mito": []}
+            return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
         for vid_file in VIDEO_FILES:
             vid_path = os.path.join(block_path, vid_file)
@@ -764,7 +1016,12 @@ def process_block(block_path, output_folder_experiment, recording_params):
     # Standard analysis + mito means
     rel_data, wma_data, mito_data = [], [], []
     if generated_csvs:
-        rel_data, wma_data, mito_data = run_analysis(
+        train_qc = _calculate_train_qc_for_block(
+            dict_csv_dfs=dict_csv_dfs,
+            block_name=block_name,
+            recording_params=recording_params,
+        )
+        rel_data, wma_data, mito_data, excluded_stim = run_analysis(
             block_path=block_path,
             recording_params=recording_params,
             output_folder_ROIs=output_folder_ROIs,
@@ -785,8 +1042,13 @@ def process_block(block_path, output_folder_experiment, recording_params):
                 dict_data_signal=dict_csv_dfs,
             )
 
-    return {"rel": rel_data, "wma": wma_data, "mito": mito_data}
-
+    return {
+        "rel": rel_data,
+        "wma": wma_data,
+        "mito": mito_data,
+        "train_qc": train_qc,
+        "excluded_stim": excluded_stim,
+    }
 
 def iGluSnFr_eval():
     run_start_time = time.perf_counter()
@@ -822,6 +1084,9 @@ def iGluSnFr_eval():
         output_folder_results = os.path.join(output_folder_experiment, "results")
         os.makedirs(output_folder_results, exist_ok=True)
 
+        output_folder_results_clean = os.path.join(output_folder_experiment, "results_clean")
+        os.makedirs(output_folder_results_clean, exist_ok=True)
+
         if not os.path.exists(exp_folder_path):
             print(f"  Experiment folder not found: {exp_folder_path}")
             continue
@@ -829,6 +1094,7 @@ def iGluSnFr_eval():
         exp_rel_prob_df = pd.DataFrame()
         exp_wma_df = pd.DataFrame()
         exp_mito_df = pd.DataFrame()
+        exp_qc_by_roi = {}
 
         for block_name in sorted(os.listdir(exp_folder_path)):
             block_path = os.path.join(exp_folder_path, block_name)
@@ -840,6 +1106,18 @@ def iGluSnFr_eval():
             rel_data = out.get("rel", [])
             wma_data = out.get("wma", [])
             mito_data = out.get("mito", [])
+            train_qc = out.get("train_qc", {})
+            excluded_stim = out.get("excluded_stim", [])
+
+            for roi, qc_values in train_qc.items():
+                if roi not in exp_qc_by_roi:
+                    exp_qc_by_roi[roi] = {}
+                exp_qc_by_roi[roi].update(qc_values)
+
+            for roi, excluded_count in excluded_stim:
+                if roi not in exp_qc_by_roi:
+                    exp_qc_by_roi[roi] = {}
+                exp_qc_by_roi[roi][f"Exclude_Stim_number_{block_name}"] = excluded_count
 
             if rel_data:
                 current_rel_df = pd.DataFrame(rel_data, columns=["ROI_number", block_name]).set_index("ROI_number")
@@ -853,27 +1131,81 @@ def iGluSnFr_eval():
                 current_mito_df = pd.DataFrame(mito_data, columns=["ROI_number", block_name]).set_index("ROI_number")
                 exp_mito_df = current_mito_df if exp_mito_df.empty else exp_mito_df.join(current_mito_df, how="outer")
 
+        rel_with_qc = pd.DataFrame()
+        wma_with_qc = pd.DataFrame()
+        mito_with_qc = pd.DataFrame()
+
         if not exp_rel_prob_df.empty:
-            exp_rel_prob_df.sort_index().reset_index().to_excel(
+            rel_plain = exp_rel_prob_df.sort_index().reset_index()
+            rel_with_qc = _append_qc_columns(rel_plain, exp_qc_by_roi)
+
+            rel_with_qc.to_excel(
                 os.path.join(output_folder_results, "release_probability.xlsx"),
                 index=False,
             )
+
         if not exp_wma_df.empty:
-            exp_wma_df.sort_index().reset_index().to_excel(
-                os.path.join(output_folder_results, "wheighted_amplitude.xlsx"),
+            wma_plain = exp_wma_df.sort_index().reset_index()
+            wma_with_qc = _append_qc_columns(wma_plain, exp_qc_by_roi)
+
+            wma_with_qc.to_excel(
+                os.path.join(output_folder_results, "weighted_amplitude.xlsx"),
                 index=False,
             )
+
         if not exp_mito_df.empty:
-            exp_mito_df.sort_index().reset_index().to_excel(
+            mito_plain = exp_mito_df.sort_index().reset_index()
+            mito_with_qc = _append_qc_columns(mito_plain, exp_qc_by_roi)
+
+            mito_with_qc.to_excel(
                 os.path.join(output_folder_results, "mito_intensity.xlsx"),
                 index=False,
             )
+
+        # Clean outputs: same columns, but ROIs failing exclusion criteria are removed.
+        if not exp_rel_prob_df.empty:
+            rel_prob_for_filter = exp_rel_prob_df.copy()
+
+            rel_clean = _filter_clean_result_df(
+                rel_with_qc,
+                rel_prob_for_filter,
+                exp_qc_by_roi,
+                recording_params,
+            )
+            rel_clean.to_excel(
+                os.path.join(output_folder_results_clean, "release_probability.xlsx"),
+                index=False,
+            )
+
+            if not wma_with_qc.empty:
+                wma_clean = _filter_clean_result_df(
+                    wma_with_qc,
+                    rel_prob_for_filter,
+                    exp_qc_by_roi,
+                    recording_params,
+                )
+                wma_clean.to_excel(
+                    os.path.join(output_folder_results_clean, "weighted_amplitude.xlsx"),
+                    index=False,
+                )
+
+            if not mito_with_qc.empty:
+                mito_clean = _filter_clean_result_df(
+                    mito_with_qc,
+                    rel_prob_for_filter,
+                    exp_qc_by_roi,
+                    recording_params,
+                )
+                mito_clean.to_excel(
+                    os.path.join(output_folder_results_clean, "mito_intensity.xlsx"),
+                    index=False,
+                )
 
     elapsed_seconds = time.perf_counter() - run_start_time
     elapsed_minutes = elapsed_seconds / 60
 
     print("\nAnalysis completed.")
     print(f"Total runtime: {elapsed_seconds:.1f} seconds ({elapsed_minutes:.2f} minutes)")
-    
+
 if __name__ == "__main__":
     iGluSnFr_eval()

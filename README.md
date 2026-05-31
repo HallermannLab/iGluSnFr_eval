@@ -201,7 +201,7 @@ For special blocks a simplified version of the above is generated.
 Created per experiment:
 
 - `results/release_probability.xlsx`
-- `results/wheighted_amplitude.xlsx`
+- `results/weighted_amplitude.xlsx`
 - `results/mito_intensity.xlsx`
 
 Each file is shaped like:
