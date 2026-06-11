@@ -486,6 +486,7 @@ def run_analysis(
     #print(f"    Running analysis for block: {block_name}")
 
     VIDEO_CSV_FILES = ["ap1+train.csv", "ap2.csv", "ap3.csv", "ap4.csv", "ap5.csv"]
+    ROIs_zip_name = recording_params.get("ROIs_zip_name","ROIs.zip")
 
     exclude_stim_baseline_percent = _get_float_param(
         recording_params,
@@ -496,7 +497,7 @@ def run_analysis(
     output_dir = output_folder_ROIs
     os.makedirs(output_dir, exist_ok=True)
 
-    rois_path = os.path.join(block_path, "ROIs.zip")
+    rois_path = os.path.join(block_path, ROIs_zip_name)
     rois_data = {}
     if os.path.exists(rois_path):
         try:
@@ -973,6 +974,8 @@ def process_block(block_path, output_folder_experiment, recording_params):
 
     recalc_csv = _metadata_flag_is_true(recording_params, "Recalc_CSV", default=1)
 
+    ROIs_zip_name = recording_params.get("ROIs_zip_name","ROIs.zip")
+
     print(f"  Processing block: {block_name}")
 
     # --- handle special blocks before checking ap1+train.tif ---
@@ -1039,18 +1042,18 @@ def process_block(block_path, output_folder_experiment, recording_params):
             print(f"    No cached CSV files found in {external_folder_CSVs}. Recalculating from videos.")
 
     if recalc_csv or not dict_csv_dfs:
-        rois_zip_path = os.path.join(block_path, "ROIs.zip")
+        rois_zip_path = os.path.join(block_path, ROIs_zip_name)
         if not os.path.exists(rois_zip_path):
-            print(f"    Warning: ROIs.zip not found at {rois_zip_path}. Skipping intensity extraction.")
+            print(f"    Warning: {ROIs_zip_name} not found at {rois_zip_path}. Skipping intensity extraction.")
             return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
         try:
             rois_data = read_roi_zip(rois_zip_path)
             if not rois_data:
-                print("    Warning: No ROIs found in ROIs.zip. Skipping intensity extraction.")
+                print("    Warning: No ROIs found in {ROIs_zip_name}. Skipping intensity extraction.")
                 return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
         except Exception as e:
-            print(f"    Error reading ROIs.zip: {e}")
+            print(f"    Error reading {ROIs_zip_name}: {e}")
             return {"rel": [], "wma": [], "mito": [], "train_qc": train_qc, "excluded_stim": excluded_stim}
 
         image_shape_hw = None

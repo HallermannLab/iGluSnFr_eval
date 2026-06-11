@@ -120,14 +120,16 @@ def _read_stack_prefer_tif_else_mp4(tif_path: str) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.uint16).reshape((n_frames, h, w))
 
 
-def extract_roi_csvs(block_path, output_folder_csvs, external_folder_csvs=None):
+def extract_roi_csvs(block_path, output_folder_csvs, recording_params, external_folder_csvs=None):
     """
     Generate CSVs from ROIs for each video tif in VIDEO_TIFS.
     Returns dict csv_name -> DataFrame
     """
     os.makedirs(output_folder_csvs, exist_ok=True)
 
-    rois_zip_path = os.path.join(block_path, "ROIs.zip")
+    ROIs_zip_name = recording_params.get("ROIs_zip_name","ROIs.zip")
+
+    rois_zip_path = os.path.join(block_path, ROIs_zip_name)
     rois_data = read_roi_zip(rois_zip_path)
 
     image_shape_hw = None
@@ -195,8 +197,8 @@ def process_special_block(
     """
     Special blocks (names length > 1), do ONLY:
       a) diff image with *_Induction params (from ind.tif)
-      b) if ROIs.zip exists: csvs from ROIs (from ind.tif)
-      c) if ROIs.zip + mito.tif exist: ROI PDFs
+      b) if ROIs.zip (i.e. ROIs_zip_name) exists: csvs from ROIs (from ind.tif)
+      c) if ROIs.zip (i.e. ROIs_zip_name) + mito.tif exist: ROI PDFs
       d) no release prob / amplitude analysis
     """
     output_rois = os.path.join(output_folder_experiment, "ROIs")
@@ -214,7 +216,9 @@ def process_special_block(
         print(f"    Warning: {ind_path} (or ind.mp4) not found. Skipping special block.")
         return {"mito_rows": []}
 
-    # Always compute diff image (does not require ROIs.zip)
+    ROIs_zip_name = recording_params.get("ROIs_zip_name","ROIs.zip")
+
+    # Always compute diff image (does not require ROIs.zip (i.e. ROIs_zip_name))
     diff_path = os.path.join(output_diff, f"{block_name}_diff.tif")
     try:
         calculate_diff_image(ind_path, diff_path, recording_params, param_suffix="_Induction")
@@ -222,7 +226,7 @@ def process_special_block(
         print(f"    Warning: Failed to compute diff image for special block {block_name}: {e}")
         return {"mito_rows": []}
 
-    rois_zip_path = os.path.join(block_path, "ROIs.zip")
+    rois_zip_path = os.path.join(block_path, ROIs_zip_name)
     if not os.path.exists(rois_zip_path):
         print(f"    Info: {rois_zip_path} not found. Skipping ROI extraction and ROI PDFs for special block {block_name}.")
         return {"mito_rows": []}
@@ -252,6 +256,7 @@ def process_special_block(
             rois_data, roi_masks, dict_csv_dfs = extract_roi_csvs(
                 block_path,
                 output_csvs,
+                recording_params,
                 external_folder_csvs=external_csvs,
             )
         else:
